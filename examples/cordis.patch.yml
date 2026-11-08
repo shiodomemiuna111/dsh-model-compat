@@ -24,6 +24,11 @@
         apiKeyEnv: EXAMPLE_A_KEY
         defaultInput: [text]          # 没声明的模型默认只看文本，避免误发图被拒
         defaultMaxTokens: 65536       # 没声明的模型默认输出上限
+        streamIdleTimeoutMs: 300000   # 卡死判定：流里 5 分钟没有新 token 就判 TIMEOUT（默认也是 300000）
+        # retryPolicy:                # 重试策略（默认 5 次、指数退避 500ms→10s、抖动 10%）
+        #   mode: normal              # normal = 只重试可重试的错误码；always = 什么都重试
+        #   maxRetries: 3
+        #   retryableCodes: [TIMEOUT, TRANSPORT, RATE_LIMIT, SERVER, EMPTY_RESPONSE]
         models:
           - id: example-a-model
             name: 示例A 模型

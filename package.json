@@ -9,8 +9,9 @@
     "probe": "node scripts/probe-capabilities.mjs",
     "check": "node scripts/resolve-check.mjs",
     "budget": "node scripts/context-budget.mjs",
+    "inject": "node scripts/inject-model.mjs",
     "matrix": "node scripts/probe-matrix.mjs",
-    "selfcheck": "node scripts/context-budget.mjs --ctx 800000 --max 65536 && node scripts/resolve-check.mjs --patch examples/cordis.patch.yml --plugin-root /opt/dsh/node_modules --budget"
+    "selfcheck": "node scripts/context-budget.mjs --ctx 800000 --max 65536 && node scripts/resolve-check.mjs --patch examples/cordis.patch.yml --plugin-root /opt/dsh/node_modules --lint --budget"
   },
   "license": "MIT"
 }

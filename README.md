@@ -42,13 +42,14 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 
 ---
 
-## 四个脚本
+## 五个脚本
 
 | 脚本 | 花不花钱 | 干什么 |
 |---|---|---|
 | `probe-capabilities.mjs` | 几乎不花（默认 <1k token） | 打 /models、基础 chat、max_tokens 上限、思考开关、视觉、流式；`--window` 才做窗口二分（⚠ 每次几十万 token） |
-| `resolve-check.mjs` | 不花钱 | 复制插件入口 + 追加一行 export，调用 `resolveProfiles(..., "strict")`，打印每条路由的真实解析结果；`--budget` 再算压缩联动 |
+| `resolve-check.mjs` | 不花钱 | 复制插件入口 + 追加一行 export，调用 `resolveProfiles(..., "strict")`，打印每条路由的真实解析结果；`--lint` 逐条隔离找出肇事路由；`--budget` 再算压缩联动 |
 | `context-budget.mjs` | 不花钱 | 单独算 threshold / retain / gap，反推「这个 maxTokens 至少要多大的 ctx」 |
+| `inject-model.mjs` | 不花钱 | 把探测结果安全写进 `cordis.patch.yml`：写入前隔离预演、写入后复验、失败自动回滚 |
 | `probe-matrix.mjs` | 不花钱（只装 npm 包） | 在 `/tmp` 里给每个历史版本搭隔离沙箱，跑同一份 YAML |
 
 都没用第三方依赖；YAML 解析借用 DSH 自带的 `yaml` 包。
@@ -99,11 +100,13 @@ retain    = floor(B * retainRatio)      (默认 0.16)
 scripts/probe-capabilities.mjs   测端点能力
 scripts/resolve-check.mjs        验 YAML 能否被解析 + 压缩联动
 scripts/context-budget.mjs       纯计算压缩阈值
+scripts/inject-model.mjs         安全写入（预演→写入→复验→回滚）
 scripts/probe-matrix.mjs         跨版本沙箱复验
 examples/cordis.patch.yml        可直接抄的两种写法
 docs/method.md                   方法论：为什么不要抄厂商数字
 docs/portability.md              跨版本验证记录与结论
 docs/pitfalls.md                 实操踩坑（含本机实测数据）
+docs/failure-modes.md            失败模式：一条坏声明会不会毒死全局、卡死怎么兜底
 ```
 
 ## License

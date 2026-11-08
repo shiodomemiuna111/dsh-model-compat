@@ -23,13 +23,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 function parseArgs(argv) {
-  const out = { patches: [], json: false, plugins: [], budget: false, headroom: 65536 };
+  const out = { patches: [], json: false, plugins: [], budget: false, lint: false, headroom: 65536 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--patch") out.patches.push(argv[++i]);
     else if (a === "--plugin-root") out.plugins.push(argv[++i]);
     else if (a === "--json") out.json = true;
     else if (a === "--budget") out.budget = true;
+    else if (a === "--lint") out.lint = true;
     else if (a === "--headroom") out.headroom = Number(argv[++i]);
     else if (a === "-h" || a === "--help") out.help = true;
     else if (a.startsWith("-")) throw new Error(`unknown flag: ${a}`);
@@ -107,7 +108,9 @@ async function readYamlFile(file, pluginRoot) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log("用法: node scripts/resolve-check.mjs [--patch file.yml ...] [--json] [--plugin-root DIR]");
+    console.log("用法: node scripts/resolve-check.mjs [--patch file.yml ...] [--lint] [--budget] [--json] [--plugin-root DIR]");
+    console.log("  --lint    逐条路由隔离 strict 解析，找出会拖垮整份配置的那一条");
+    console.log("  --budget  计算压缩联动（threshold / retain / gap）");
     return 0;
   }
   const plugin = locatePlugin(args.plugins);
@@ -147,12 +150,45 @@ async function main() {
     throw new Error(`补丁层里没有 llm-pi-ai.providers：${loaded.join(", ")}`);
   }
 
-  // 3) 严格解析
+  // 2b) 隔离 lint：逐条路由单独 strict 解析，定位"是哪一条把整份配置毒死了"
+  let lintReport = null;
+  if (args.lint) {
+    lintReport = [];
+    for (const [route, profile] of Object.entries(providers)) {
+      let ok = true, msg = null, models = [];
+      try {
+        const one = await resolveProfiles({ [route]: profile }, "strict");
+        for (const [, r] of one) models = (await r.piProvider.getModels()).map((m) => m.id);
+      } catch (e) {
+        ok = false;
+        msg = String(e?.message ?? e).slice(0, 160);
+      }
+      lintReport.push({ route, ok, models, error: msg });
+    }
+    const bad = lintReport.filter((r) => !r.ok);
+    if (args.json) {
+      // JSON 分支统一在最后输出，这里只记录
+    } else {
+      console.log("逐路由隔离检查（strict，一条不过不会拖累别的）：");
+      for (const r of lintReport) {
+        console.log(`  ${r.ok ? "✓" : "✗"} ${r.route}${r.ok ? ` [${r.models.join(", ")}]` : ` ← ${r.error}`}`);
+      }
+      if (bad.length) console.log(`  注意：真实 DSH 的 strict 校验是"全体或全无"，上面 ${bad.length} 条失败会让整份配置被拒；` + `去掉它们或单独分一个 patch 层即可。`);
+    }
+  }
+
+  // 3) 严格解析（全体）
   let routes;
   try {
     routes = await resolveProfiles(providers, "strict");
   } catch (err) {
     console.error(`解析失败（strict）：${err?.message ?? err}`);
+    if (lintReport) {
+      const bad = lintReport.filter((r) => !r.ok);
+      if (bad.length) console.error(`肇事路由：${bad.map((r) => r.route).join(", ")}`);
+    } else {
+      console.error(`提示：加 --lint 可以逐条隔离，找出是哪一条把整份配置毒死了。`);
+    }
     return 1;
   }
 
@@ -198,7 +234,7 @@ async function main() {
   }
 
   if (args.json) {
-    console.log(JSON.stringify({ ok: !failed, patches: loaded, models: report, ...(args.budget ? { budget } : {}) }, null, 2));
+    console.log(JSON.stringify({ ok: !failed, patches: loaded, models: report, ...(args.budget ? { budget } : {}), ...(lintReport ? { lint: lintReport } : {}) }, null, 2));
   } else {
     console.log(`插件: ${plugin.root}`);
     console.log(`补丁: ${loaded.join(", ")}`);

@@ -88,6 +88,15 @@ async function safeFetch(url, init) {
   catch (e) { throw new NetError(`连不上 ${new URL(url).host}：${e?.cause?.code ?? e?.message ?? e}`); }
 }
 
+/** 口音检测：很多聚合网关其实是某家原生 API 的转发。 */
+function accentOf(base) {
+  const h = new URL(base).host.toLowerCase();
+  const m = [[/bigmodel|zhipu|dashscope|aliyun|volces|qwen|moonshot|kimi|baichuan|minimax|z\.ai|glm/, "qwen"],
+             [/openai|azure|apizn|anthropic|claude|deepseek/, "openai"]];
+  for (const [re, tag] of m) if (re.test(h)) return tag;
+  return "unknown";
+}
+
 async function post(o, key, path, body) {
   const t0 = Date.now();
   const res = await safeFetch(`${o.base.replace(/\/$/, "")}${path}`, {
@@ -256,11 +265,16 @@ ${levels}`;
   findings.summary = {
     listedInModels: listed,
     modelFields,
+    accent: accentOf(o.base),
     outputCap: maxTokens,
     thinkingSwitchable: switchable,
     vision: visionOk,
     streamDeltaKeys: [...deltaKeys],
     contextWindow,
+    switchFormat: switchable.length === 0 ? null
+      : switchable.includes("enable_thinking") ? "qwen"
+      : switchable.includes("thinking.type") ? "deepseek"
+      : "openai",
   };
 
   if (o.json) console.log(JSON.stringify(findings, null, 2));
