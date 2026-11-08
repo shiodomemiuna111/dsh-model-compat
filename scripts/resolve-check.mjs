@@ -32,7 +32,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--patch") out.patches.push(argv[++i]);
-    else if (a === "--plugin-root") out.plugins.push(argv[++i]);
+    else if (a === "--plugin-root" || a === "--plugin") out.plugins.push(argv[++i]);
     else if (a === "--json") out.json = true;
     else if (a === "--budget") out.budget = true;
     else if (a === "--lint") out.lint = true;

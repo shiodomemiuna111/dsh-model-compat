@@ -133,7 +133,7 @@ node scripts/resolve-check.mjs --lint
 # 2) 导入：逐路由隔离验证 → 只写入通过的 → 写后复验 → 失败自动回滚
 node scripts/merge-routes.mjs \
   --patch ~/.dsh/profiles/web/cordis.patch.yml \
-  --from new-ports.yml --plugin-root /opt/dsh/node_modules
+  --from new-ports.yml --plugin /opt/dsh/node_modules
 ```
 
 `merge-routes` 只写入自己维护的托管块（`# >>> managed-by-dsh-model-compat` … `# <<<`），

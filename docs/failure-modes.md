@@ -77,7 +77,7 @@ DSH 加载 `llm-pi-ai` 配置时用的是 **strict** 校验。strict 是「全�
 ```bash
 node scripts/merge-routes.mjs \
   --patch ~/.dsh/profiles/web/cordis.patch.yml \
-  --from new-ports.yml --plugin-root /opt/dsh/node_modules
+  --from new-ports.yml --plugin /opt/dsh/node_modules
 ```
 
 流程：

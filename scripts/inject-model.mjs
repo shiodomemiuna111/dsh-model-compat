@@ -32,12 +32,12 @@ for (let i = 0; i < argv.length; i++) {
   if (a === "--patch") o.patch = next();
   else if (a === "--route") o.route = next();
   else if (a === "--probe") o.probe = next();
-  else if (a === "--plugin-root") o.pluginRoot = next();
+  else if (a === "--plugin-root" || a === "--plugin") o.pluginRoot = next();
   else if (a === "--api-key-env") o.apiKeyEnv = next();
   else if (a === "--display-name") o.displayName = next();
   else if (a === "--dry-run") o.dryRun = true;
   else if (a === "--force") o.force = true;
-  else if (a === "--assume-ctx") o.assumeCtx = next();
+  else if (a === "--assume-ctx" || a === "--assume-contextWindow") o.assumeCtx = next();
   else if (a === "--max") o.maxOverride = next();
   else if (a === "--api") o.api = next();
   else if (a === "-h" || a === "--help") { console.log("用法见 scripts/inject-model.mjs 顶部注释"); process.exit(0); }
@@ -80,10 +80,12 @@ const switchable = Array.isArray(s.thinkingSwitchable) && s.thinkingSwitchable.l
 
 // thinkingFormat：只认探测给出的 switchFormat；没有证据就**不写**这个字段（宁可少写）。
 const fmt = switchable ? (s.switchFormat ?? null) : null;
-if (!fmt) console.error("提示：探测没证明这个端点能开/关思考，不写 thinkingFormat（宁可少写，避免静默退化）。");
+if (!fmt) console.error("提示：探测没证明这个端点能开/关思考，不写 compat（宁可少写，避免静默退化）。");
+// 只有真探测到「思考可开关」才写 compat；否则整块不写，别塞一个没证据的 supportsReasoningEffort。
+const effortProven = switchable && (s.thinkingSwitchable ?? []).some((v) => String(v).startsWith("reasoning_effort"));
 const compatBlock = fmt
-  ? `            compat:\n              thinkingFormat: ${fmt}\n              supportsReasoningEffort: true\n`
-  : `            compat:\n              supportsReasoningEffort: true\n`;
+  ? `            compat:\n              thinkingFormat: ${fmt}${effortProven ? "\n              supportsReasoningEffort: true" : ""}\n`
+  : "";
 
 // 压缩联动自检：不允许写一条注定被拒的声明
 const B = ctx - maxTokens;
@@ -101,8 +103,9 @@ if (problems.length && !o.force) {
   process.exit(1);
 }
 
-// api：用探测记录的真实协议；没有就要求显式给
-const apiKind = o.api ?? s.accent ?? probe.summary?.api ?? "openai-completions";
+// api：探测脚本只会说 OpenAI 兼容协议（它自己就是按 /chat/completions 打的），
+// 绝不能拿 summary.accent（那是 thinkingFormat 的口味，如 "qwen"）当 api 写进 YAML。
+const apiKind = o.api ?? "openai-completions";
 const block = `      ${o.route}:
         displayName: ${o.displayName ?? o.route}
         api: ${apiKind}

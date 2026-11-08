@@ -245,6 +245,10 @@ async function main() {
   const levels = supportsReasoning
     ? `            reasoningEfforts:\n              off: null\n              low: "low"\n              high: "high"\n`
     : `            reasoningEfforts: false\n`;
+  const switchFormat = switchable.length === 0 ? null
+    : switchable.some((v) => String(v).startsWith("enable_thinking")) ? "qwen"
+    : switchable.some((v) => String(v).startsWith("thinking")) ? "deepseek"
+    : "openai";
   const yamlSnippet = `      custom-${new URL(o.base).hostname.replace(/\./g, "-")}:
         displayName: ${new URL(o.base).hostname}
         api: openai-completions
@@ -254,7 +258,7 @@ async function main() {
         defaultMaxTokens: 65536
         models:
           - compat:
-              thinkingFormat: qwen        # 有"可关"证据才写；没有就删掉这行
+              thinkingFormat: ${switchFormat}        # 按探测到的开关字段写；探测不到就删掉这行
             id: ${o.model}
             name: ${o.model}
             contextWindow: ${contextWindow ?? 1000000}
@@ -271,10 +275,7 @@ ${levels}`;
     vision: visionOk,
     streamDeltaKeys: [...deltaKeys],
     contextWindow,
-    switchFormat: switchable.length === 0 ? null
-      : switchable.includes("enable_thinking") ? "qwen"
-      : switchable.includes("thinking.type") ? "deepseek"
-      : "openai",
+    switchFormat,
   };
 
   if (o.json) console.log(JSON.stringify(findings, null, 2));

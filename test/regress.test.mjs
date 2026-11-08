@@ -379,3 +379,77 @@ test("--replace 时允许覆盖同名路由，且不产生重复键", () => {
   assert.ok(after.includes("https://new.invalid/v1"), "应该被覆盖成新地址");
   rmSync(d, { recursive: true, force: true });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 7：真实使用中「跑不转」的 CLI bug（用户实际照文档敲命令就会撞到）
+// ═══════════════════════════════════════════════════════════════════════
+
+const INJECT = join(ROOT, "scripts", "inject-model.mjs");
+
+function runCli(script, args, cwd) {
+  try {
+    const out = execFileSync(process.execPath, [script, ...args], { encoding: "utf8", cwd, stdio: ["ignore", "pipe", "pipe"] });
+    return { code: 0, out };
+  } catch (e) {
+    return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+  }
+}
+
+const probeFixture = (summary) => JSON.stringify({
+  base: "https://example.invalid/v1",
+  model: "m1",
+  steps: [],
+  summary: { listedInModels: true, outputCap: 393216, vision: true, thinkingSwitchable: ["enable_thinking:false"], switchFormat: "openai", contextWindow: null, accent: "qwen", ...summary },
+});
+
+test("bug G：merge-routes 接受 --plugin 指向 node_modules（不是只有包目录才行）", skipIfNoPlugin, () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  writeFileSync(target, TARGET);
+  const src = join(d, "src.yml");
+  writeFileSync(src, `providers:\n${goodRoute("nm-route")}`);
+  const r = runMerge(["--patch", target, "--from", src, "--plugin", dirname(dirname(PLUGIN))], d);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /nm-route/);
+  assert.doesNotMatch(r.out, /找不到.*lib\/index\.js/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("bug H：--plugin 指错目录时给出可读报错（列出试过的路径 + exit 2）", () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  writeFileSync(target, TARGET);
+  const src = join(d, "src.yml");
+  writeFileSync(src, `providers:\n${goodRoute("x-route")}`);
+  const r = runMerge(["--patch", target, "--from", src, "--plugin", join(d, "nope")], d);
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /dsh-llm-pi-ai/);
+  assert.match(r.out, /--plugin/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("bug I：inject-model 接受 --assume-contextWindow（报错文案里就是这么写的）", skipIfNoPlugin, () => {
+  const d = tmp();
+  const patch = join(d, "cordis.patch.yml");
+  writeFileSync(patch, TARGET);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, probeFixture({}));
+  const r = runCli(INJECT, ["--patch", patch, "--route", "probed", "--probe", probe, "--plugin-root", PLUGIN, "--assume-contextWindow", "1000000", "--dry-run"], d);
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.out, /未知参数/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("bug J：注入的 api 必须是协议名，不能把 thinkingFormat 的口味（qwen）当 api 写进去", skipIfNoPlugin, () => {
+  const d = tmp();
+  const patch = join(d, "cordis.patch.yml");
+  writeFileSync(patch, TARGET);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, probeFixture({}));
+  const r = runCli(INJECT, ["--patch", patch, "--route", "probed", "--probe", probe, "--plugin-root", PLUGIN, "--assume-contextWindow", "1000000"], d);
+  assert.equal(r.code, 0, r.out);
+  const after = readFileSync(patch, "utf8");
+  assert.match(after, /api: openai-completions/);
+  assert.doesNotMatch(after, /api: qwen/, "accent 被当成 api 了");
+  rmSync(d, { recursive: true, force: true });
+});

@@ -34,7 +34,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--from") o.from.push(argv[++i]);
   else if (a === "--patch") o.patch = argv[++i];
-  else if (a === "--plugin") o.pluginRoot = argv[++i];
+  else if (a === "--plugin" || a === "--plugin-root") o.pluginRoot = argv[++i];
   else if (a === "--no-verify") o.verify = false;
   else if (a === "--replace") o.replace = true;
   else if (a === "--dry-run") o.dryRun = true;
@@ -56,14 +56,59 @@ function yamlLib() {
 }
 const YAML = yamlLib();
 
+function isPluginDir(dir) {
+  return existsSync(join(dir, "lib", "index.js"));
+}
+
+/**
+ * 找到 @deepseek-ai/dsh-llm-pi-ai 包目录。
+ * 接受三种写法（用户/README 里都可能这么写，别让它静默走错）：
+ *   1. 包目录本身    /opt/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai
+ *   2. node_modules  /opt/dsh/node_modules
+ *   3. DSH 安装根    /opt/dsh
+ */
 function locatePlugin() {
-  if (o.pluginRoot) return resolve(o.pluginRoot);
-  const guess = join(process.env.DSH_ROOT ?? "/opt/dsh", "node_modules", "@deepseek-ai", "dsh-llm-pi-ai");
-  if (!existsSync(guess)) {
-    console.error(`找不到 dsh-llm-pi-ai（试过 ${guess}）；用 --plugin 指定`);
+  const explicit = o.pluginRoot !== null && o.pluginRoot !== undefined;
+  const roots = explicit ? [resolve(o.pluginRoot)] : [resolve(process.env.DSH_ROOT ?? "/opt/dsh", "node_modules")];
+
+  const tried = [];
+  for (const r of roots) {
+    const candidates = [
+      r,
+      join(r, "@deepseek-ai", "dsh-llm-pi-ai"),
+      join(r, "node_modules", "@deepseek-ai", "dsh-llm-pi-ai"),
+      join(r, "node_modules"),
+    ];
+    for (const c of candidates) {
+      if (!isPluginDir(c)) { tried.push(c); continue; }
+      return c;
+    }
+  }
+  // 用户显式给了 --plugin 却找不到：直接报错，不要偷偷用别的安装（那会让你以为改的是 A 实际改了 B）
+  if (explicit) {
+    console.error(`--plugin ${o.pluginRoot} 下没有 @deepseek-ai/dsh-llm-pi-ai（要能看到 lib/index.js）。试过：\n` +
+      [...new Set(tried)].map((t) => `  ${t}`).join("\n") +
+      "\n三种写法都行：/opt/dsh  或  /opt/dsh/node_modules  或  <包目录>");
     process.exit(2);
   }
-  return guess;
+  // 没给 --plugin 时，再从 cwd / 脚本目录向上找
+  for (const base of [process.cwd(), here]) {
+    let dir = base;
+    for (let i = 0; i < 8; i++) {
+      const c = join(dir, "node_modules", "@deepseek-ai", "dsh-llm-pi-ai");
+      if (isPluginDir(c)) return c;
+      tried.push(c);
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  console.error(
+    "找不到 @deepseek-ai/dsh-llm-pi-ai 包目录（要能看到 lib/index.js）。试过：\n" +
+    [...new Set(tried)].slice(0, 8).map((t) => `  ${t}`).join("\n") +
+    "\n用法：--plugin /opt/dsh/node_modules  或  --plugin /opt/dsh  或  --plugin <包目录>"
+  );
+  process.exit(2);
 }
 const pluginRoot = locatePlugin();
 

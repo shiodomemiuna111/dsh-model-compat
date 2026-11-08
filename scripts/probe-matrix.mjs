@@ -107,24 +107,89 @@ function prepare(version) {
   return { dir, piVersion };
 }
 
-async function check(version, dir) {
-  const probe = join(dir, "node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/__probe.mjs");
-  const entry = join(dir, "node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js");
-  writeFileSync(probe, readFileSync(entry, "utf8") + "\nexport { resolveProfiles };\n");
+const THINKING_FORMATS_11 = ["openai", "deepseek", "openrouter", "together", "baseten", "zai", "qwen", "chat-template", "qwen-chat-template", "string-thinking", "ant-ling"];
+
+/** 能力探针：不用硬编码枚举，而是拿该版本自己的 Config 逐个试出来。 */
+async function capabilityProbes(mod, lib) {
+  const caps = {};
+  const tryConfig = (cfg) => {
+    try { mod.Config(cfg); return true; } catch { return false; }
+  };
+  const route = (modelExtra, routeExtra) => ({
+    providers: { zz: { api: "openai-completions", baseURL: "http://127.0.0.1:9/v1", models: [{ id: "m1", contextWindow: 1024, maxTokens: 64, ...modelExtra }], ...(routeExtra ?? {}) } },
+  });
+
+  // 1) 基础形状
+  caps.configShape = tryConfig(route({}));
+
+  // 2) thinkingFormat 真实枚举（逐值试，记录接受集合）
+  caps.thinkingFormats = THINKING_FORMATS_11.filter((f) => tryConfig(route({ compat: { thinkingFormat: f } })));
+  caps.thinkingFormatBogus = tryConfig(route({ compat: { thinkingFormat: "bogus" } }));
+  caps.thinkingFormatCase = tryConfig(route({ compat: { thinkingFormat: "Qwen" } }));
+
+  // 3) 模态
+  caps.modalities = ["text", "image", "video"].filter((m) => tryConfig(route({ input: [m] })));
+  caps.inputAsString = tryConfig(route({ input: "image" }));
+
+  // 4) reasoningEfforts 形状
+  caps.efforts = {
+    false: tryConfig(route({ reasoningEfforts: false })),
+    empty: tryConfig(route({ reasoningEfforts: {} })),
+    offNull: tryConfig(route({ reasoningEfforts: { off: null } })),
+    highNull: tryConfig(route({ reasoningEfforts: { high: null } })),
+    highWire: tryConfig(route({ reasoningEfforts: { high: "high" } })),
+    highNumber: tryConfig(route({ reasoningEfforts: { high: 123 } })),
+  };
+
+  // 5) 未知字段容忍度（静默接受 = 用户以为自己配了其实没生效）
+  caps.unknown = {
+    route: tryConfig(route({}, { totallyUnknownRouteKey: 1 })),
+    model: tryConfig(route({ totallyUnknownModelKey: 1 })),
+    compat: tryConfig(route({ compat: { totallyUnknownCompat: 1 } })),
+  };
+
+  // 6) 语义层：默认值 & 重名/重复键行为
   try {
-    const { resolveProfiles } = await import(`${probe}?v=${version}`);
+    const resolved = await mod.resolveProfiles({ zz: { api: "openai-completions", baseURL: "http://127.0.0.1:9/v1", models: [{ id: "m1" }] } }, "strict");
+    const models = await resolved.get("zz").piProvider.getModels();
+    caps.defaults = { ctx: models[0].contextWindow, max: models[0].maxTokens, input: models[0].input };
+  } catch (e) {
+    caps.defaults = { error: String(e?.message ?? e).slice(0, 120) };
+  }
+
+  // 7) 关键导出符号是否存在（脚本依赖的 API 面）
+  const src = lib;
+  caps.exports = {
+    Config: /\bConfig\b/.test(src.split("\n").find((l) => l.includes("z.object")) ? src : src),
+    resolveProfiles: /\bfunction resolveProfiles\b|\bresolveProfiles =/.test(src),
+    compatProfile: /\bcompatProfile\b/.test(src),
+    SUPPORTED_THINKING_FORMATS: /\bSUPPORTED_THINKING_FORMATS\b/.test(src),
+  };
+  return caps;
+}
+
+async function check(version, dir) {
+  const libDir = join(dir, "node_modules/@deepseek-ai/dsh-llm-pi-ai/lib");
+  const probe = join(libDir, "__probe.mjs");
+  const entry = join(libDir, "index.js");
+  const src = readFileSync(entry, "utf8");
+  const hasConfig = /\bconst Config = |\bconst Config=|let Config/.test(src) || /\bConfig = z\.object/.test(src);
+  writeFileSync(probe, src + `\nexport { resolveProfiles${hasConfig ? ", Config" : ""} };\n`);
+  try {
+    const mod = await import(`${probe}?v=${version}`);
     const YAML = require(join(nm, "yaml"));
     const doc = YAML.parse(readFileSync(rp(opt.patch), "utf8"));
     const entryDoc = (Array.isArray(doc) ? doc : []).find((e) => e?.id === "llm-pi-ai");
     const providers = entryDoc?.config?.providers ?? {};
-    const routes = await resolveProfiles(providers, "strict");
+    const routes = await mod.resolveProfiles(providers, "strict");
     const rows = [];
-    for (const [route, r] of routes) {
+    for (const [routeName, r] of routes) {
       for (const m of await r.piProvider.getModels()) {
-        rows.push(`${route}/${m.id} ctx=${m.contextWindow} max=${m.maxTokens} input=[${m.input}] reasoning=${m.reasoning}`);
+        rows.push(`${routeName}/${m.id} ctx=${m.contextWindow} max=${m.maxTokens} input=[${m.input}] reasoning=${m.reasoning}`);
       }
     }
-    return { version, ok: true, rows };
+    const caps = hasConfig ? await capabilityProbes(mod, src) : { error: "该版本没有 Config（结构层不可探测）" };
+    return { version, ok: true, rows, caps };
   } catch (e) {
     return { version, ok: false, error: String(e?.message ?? e).slice(0, 300) };
   } finally {
@@ -153,5 +218,31 @@ console.log(`\n${passed.length}/${results.length} 个版本通过`);
 if (passed.length) {
   const sig = new Set(passed.map((r) => r.rows.join("|")));
   console.log(sig.size === 1 ? "✓ 所有通过的版本解析结果完全一致" : `✗ 解析结果不一致（${sig.size} 种）`);
+
+  // ── 能力矩阵：不只比 4 个字段，还比「结构层到底接不接受」
+  console.log("\n能力矩阵（✓=接受 / ✗=拒绝 / - = 该版本探测不到）");
+  const mark = (v) => (v === true ? "✓" : v === false ? "✗" : "-");
+  console.log("版本          配置  thinkingFormat 枚举                 bogus  Qwen  模态            unknown(route/model/compat)");
+  const allFormats = new Set();
+  for (const r of passed) for (const f of r.caps?.thinkingFormats ?? []) allFormats.add(f);
+  for (const r of passed) {
+    const c = r.caps ?? {};
+    const fmts = c.thinkingFormats ?? [];
+    console.log(
+      `${r.version.padEnd(13)} ${mark(c.configShape)}   ${String(fmts.length).padStart(2)}/11 ${fmts.join(",").slice(0, 34).padEnd(36)} ${mark(c.thinkingFormatBogus)}   ${mark(c.thinkingFormatCase)}   ${(c.modalities ?? []).join(",").padEnd(14)} ${mark(c.unknown?.route)}/${mark(c.unknown?.model)}/${mark(c.unknown?.compat)}`
+    );
+  }
+  // 我方示例配置用到的能力，逐项要求每个版本都支持
+  const required = [
+    ["thinkingFormat: qwen", (c) => (c.thinkingFormats ?? []).includes("qwen")],
+    ["thinkingFormat 枚举已校验（bogus 必须被拒）", (c) => c.thinkingFormatBogus === false],
+    ["input: image", (c) => (c.modalities ?? []).includes("image")],
+    ["reasoningEfforts {high:\"high\"}", (c) => c.efforts?.highWire === true],
+  ];
+  console.log("\n本项目示例配置依赖的能力：");
+  for (const [label, test] of required) {
+    const fail = passed.filter((r) => r.caps && !test(r.caps)).map((r) => r.version);
+    console.log(`  ${fail.length ? "✗" : "✓"} ${label}${fail.length ? `（缺失：${fail.join(", ")}）` : "（全部版本具备）"}`);
+  }
 }
 process.exit(passed.length === results.length ? 0 : 1);
