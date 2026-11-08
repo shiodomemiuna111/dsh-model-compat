@@ -23,14 +23,17 @@
 | `reasoningEfforts: {high: null}` | PASS | **REJECT** `needs the wire value` |
 | `baseURL: ""` | PASS | **REJECT** `has an empty baseURL` |
 | `contextWindow: "128k"` | **REJECT** | — |
-| `compat` 写在**路由层** | PASS | PASS —— **两层都过、也不生效**（真盲区，靠静态审计兜） |
+| `compat` 写在**路由层** | PASS | PASS —— **会生效**（并进该路由每个模型）；若路由下没有模型说支持该开关的协议，则 REJECT |
 | 模型级 `compat.foo` | PASS | **REJECT** `which no wire protocol declares` |
 
 两条实际结论：
 
 1. **只调 `resolveProfiles` 的校验器会漏掉一半**（V5 的错）。
-2. **唯一的「两层都静默」是路由级 compat**：`index.js:631-633` 对 route 级只处理 gate 声明为
-   `"offer"` 的字段，其余直接 `continue`。`staticAudit` 会把它报成 error。
+2. **路由级 compat 会生效，不是盲区**（旧版这里写反了）：`index.js:627-634` 先按协议 gate 取字段，
+   再并进每个模型；如果路由下没有任何模型说「支持这个开关」的协议，解析会报
+   `provider "x" route sets compat "…", but no model on the route speaks a protocol that takes it`。
+   真正两层都静默的写法是：**模型条目里写 `api` / `baseURL`（只认路由层，被丢弃）**、
+   **未知字段拼错**（两层都丢弃）。`staticAudit` 会把它们报成 warn。
 
 ---
 
@@ -55,10 +58,11 @@ DSH 加载 `llm-pi-ai` 配置时用的是 **strict** 校验。strict 是「全�
 | `thinkingFormat: bogus` / `"Qwen"` | **Config 层就 REJECT**（V5 曾误报为静默通过） |
 | `input: ["video"]` / `"image"` | **Config 层就 REJECT**（同上） |
 | `reasoningEfforts: {high: 123}` | **Config 层就 REJECT**（同上） |
-| `compat` 写在**路由层** | **两层都过、也不生效** ← 真正的静默坑 |
+| `compat` 写在**路由层** | **会生效**（并进该路由每个模型）；没有模型支持该协议才报错 |
 
-**唯一真实的两层盲区是路由级 compat**：写错位置不会报错、也不会生效，
-你以为调了思考格式，实际什么都没发生。`resolve-check.mjs` 的静态审计会把它标成 error。
+**真实的两层静默坑是模型条目里的 `api`/`baseURL` 与拼错的未知字段**（路由级 compat 会生效）：
+你把协议/地址写在单条模型上，以为改了协议，实际什么都没发生。`resolve-check.mjs` 的静态审计会报
+`route-only-key-on-model` / `unknown-model-key` 两类 warn。
 
 ### 修法：两层
 
@@ -100,7 +104,7 @@ node scripts/merge-routes.mjs \
 ```yaml
     providers:
       custom-manual: {...}        # 你的，脚本不碰
-      # >>> managed-by-dsh-model-compat（以下由 merge-routes.mjs 维护，手改会被覆盖）
+      # >>> managed-by-dsh-model-compat
       custom-a: {...}
       # <<< managed-by-dsh-model-compat
 ```

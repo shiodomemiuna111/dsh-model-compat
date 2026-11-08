@@ -173,8 +173,10 @@ async function check(version, dir) {
   const probe = join(libDir, "__probe.mjs");
   const entry = join(libDir, "index.js");
   const src = readFileSync(entry, "utf8");
-  const hasConfig = /\bconst Config = |\bconst Config=|let Config/.test(src) || /\bConfig = z\.object/.test(src);
-  writeFileSync(probe, src + `\nexport { resolveProfiles${hasConfig ? ", Config" : ""} };\n`);
+  // 只追加 resolveProfiles：Config 本来就是插件导出的符号（index.js:3022
+  // `export { Config, PiAiAdapter, … }`），再追加一次会 Duplicate export 直接崩。
+  const hasConfig = /\bConfig\b/.test(src);
+  writeFileSync(probe, src + "\nexport { resolveProfiles };\n");
   try {
     const mod = await import(`${probe}?v=${version}`);
     const YAML = require(join(nm, "yaml"));

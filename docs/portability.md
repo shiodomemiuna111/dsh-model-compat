@@ -57,7 +57,7 @@
 ## 溢出识别也一致
 
 上游返回「上下文超了」时，DSH 靠 pi-ai 的厂商正则表识别。老版 `pi-ai@0.82.1` 的
-`dist/utils/overflow.js` 有 33 条正则，新版 1.5.0 有 35 条，**都包含** DashScope/Qwen 的
+`dist/utils/overflow.js` 在 0.1.5 时代有 25 条正则，1.5.0 有 27 条（实测逐版本 `grep` 计数），**都包含** DashScope/Qwen 的
 `/range of input length should be/i`。所以「窗口声明偏大 → 靠 400 兜底恢复」这条路径在旧版也成立。
 
 ## 注意

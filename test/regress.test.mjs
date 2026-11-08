@@ -76,14 +76,15 @@ test("空 baseURL 由语义层拦", skipIfNoPlugin, async () => {
   assert.match(r.semantic.error, /empty baseURL/);
 });
 
-test("路由级 compat 完全静默（两层都过、也不生效）—— 审计发现的真盲区", skipIfNoPlugin, async () => {
+test("路由级 compat 会生效（V6 曾把「会生效」写反成静默盲区）", skipIfNoPlugin, async () => {
   const r = await verifyLoadPath(PLUGIN, {
     r: { api: "openai-completions", baseURL: "https://example.invalid/v1", compat: { thinkingFormat: "qwen" }, models: [{ id: "m", contextWindow: 100000, maxTokens: 8192 }] },
   });
   assert.equal(r.schema.ok, true);
   assert.equal(r.semantic.ok, true);
-  // 所以必须由静态审计补上这一刀
-  assert.ok(auditCodes({ r: { baseURL: "https://x/v1", compat: { thinkingFormat: "qwen" }, models: [{ id: "m" }] } }).includes("route-compat-ignored"));
+  assert.equal(r.routes.r.details[0].thinkingFormat, "qwen", "路由级 compat 应该并进模型");
+  // 合法字段不该被审计报错
+  assert.ok(!auditCodes({ r: { baseURL: "https://x/v1", compat: { thinkingFormat: "qwen" }, models: [{ id: "m" }] } }).some((c) => c.startsWith("route-compat")));
 });
 
 test("探针文件用完不残留（SIGKILL 以外的正常路径）", skipIfNoPlugin, async () => {
@@ -108,8 +109,13 @@ test("合法字段不再误报（transport / cacheRetention / timeoutMs / reason
   assert.deepEqual(codes.filter((c) => c.startsWith("unknown")), []);
 });
 
-test("路由级 compat 被报成 error", () => {
-  assert.ok(auditCodes({ r: { baseURL: "https://x/v1", compat: { foo: 1 }, models: [{ id: "m" }] } }).includes("route-compat-ignored"));
+test("路由级 compat 的非法字段被报出来（声明了没有协议认的开关）", () => {
+  assert.ok(auditCodes({ r: { baseURL: "https://x/v1", compat: { foo: 1 }, models: [{ id: "m" }] } }).includes("bad-route-compat-key"));
+});
+
+test("模型条目里写 api / baseURL 会被提示「只认路由层」", () => {
+  const codes = auditCodes({ r: { baseURL: "https://x/v1", models: [{ id: "m", api: "anthropic-messages" }] } });
+  assert.ok(codes.includes("route-only-key-on-model"), `实际：${codes.join(",")}`);
 });
 
 test("reasoningEfforts.high=null 被报出来（旧版被 v!==null 放过）", () => {
@@ -451,5 +457,133 @@ test("bug J：注入的 api 必须是协议名，不能把 thinkingFormat 的口
   const after = readFileSync(patch, "utf8");
   assert.match(after, /api: openai-completions/);
   assert.doesNotMatch(after, /api: qwen/, "accent 被当成 api 了");
+  rmSync(d, { recursive: true, force: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 8：第二轮对抗审计（audit-breaker）挖出的静默破坏
+// 每条都在 cb11b4a 上做过红跑：4 空格缩进会把块外手写路由吞掉（exit 0）；
+// 多个 - id: llm-pi-ai 条目会写进不生效的那一个；probe 缺字段会写 undefined。
+// ═══════════════════════════════════════════════════════════════════════
+
+const parseYaml = async (text) => {
+  const { createRequire } = await import("node:module");
+  const require = createRequire(import.meta.url);
+  const YAML = require("/opt/dsh/node_modules/yaml");
+  return YAML.parse(text);
+};
+
+const INDENT4 = `# 4 空格缩进（providers 子项缩进 8）
+- id: llm-pi-ai
+  config:
+    providers:
+        hand-route:
+            api: openai-completions
+            baseURL: https://example.invalid/v1
+            models:
+                - id: hand-model
+                  contextWindow: 200000
+                  maxTokens: 8192
+`;
+
+test("4 空格缩进的目标文件：块外手写路由不被吞（cb11b4a 上会整条消失）", async () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  writeFileSync(target, INDENT4);
+  const src = join(d, "src.yml");
+  writeFileSync(src, `providers:\n${goodRoute("new-route")}`);
+  const r = runMerge(["--patch", target, "--from", src, "--plugin", PLUGIN], d);
+  assert.equal(r.code, 0, r.out);
+  const doc = await parseYaml(readFileSync(target, "utf8"));
+  const provs = doc?.[0]?.config?.providers ?? {};
+  assert.ok("hand-route" in provs, `手写路由被吞了，实际 keys：${Object.keys(provs)}`);
+  assert.ok("new-route" in provs);
+  assert.equal(provs["hand-route"].models?.[0]?.id, "hand-model");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("多个 - id: llm-pi-ai 条目 → 拒绝写入并说明原因（cb11b4a 上会静默写进不生效的那个）", () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  const two = `${TARGET}- id: llm-pi-ai\n  config:\n    providers: {}\n`;
+  writeFileSync(target, two);
+  const src = join(d, "src.yml");
+  writeFileSync(src, `providers:\n${goodRoute("dup-new")}`);
+  const r = runMerge(["--patch", target, "--from", src, "--plugin", PLUGIN], d);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /2 个 '- id: llm-pi-ai'/);
+  assert.equal(readFileSync(target, "utf8"), two, "拒绝时不该改文件");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("inject-model：probe.json 缺 base 时拒绝（cb11b4a 上会写 baseURL: undefined）", () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  writeFileSync(target, INDENT4);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify({ model: "m", summary: { contextWindow: 200000, outputCap: 65536 } }));
+  let out = "";
+  let code = 0;
+  try {
+    execFileSync(process.execPath, [join(ROOT, "scripts", "inject-model.mjs"),
+      "--patch", target, "--route", "custom-x", "--probe", probe, "--plugin-root", "/opt/dsh/node_modules"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) { code = e.status ?? 1; out = `${e.stdout ?? ""}${e.stderr ?? ""}`; }
+  assert.equal(code, 2, out);
+  assert.match(out, /没有 base/);
+  assert.doesNotMatch(readFileSync(target, "utf8"), /undefined/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("--replace 覆盖同名路由时不吞掉块外兄弟路由", async () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  const two = `- id: llm-pi-ai
+  config:
+    providers:
+      keep-me:
+        api: openai-completions
+        baseURL: https://old.invalid/v1
+        models:
+          - id: keep
+            contextWindow: 200000
+            maxTokens: 8192
+      second:
+        api: openai-completions
+        baseURL: https://second.invalid/v1
+        models:
+          - id: second
+            contextWindow: 200000
+            maxTokens: 8192
+`;
+  writeFileSync(target, two);
+  const src = join(d, "src.yml");
+  writeFileSync(src, `providers:\n${goodRoute("keep-me", "https://new.invalid/v1")}`);
+  const r = runMerge(["--patch", target, "--from", src, "--replace", "--plugin", PLUGIN], d);
+  assert.equal(r.code, 0, r.out);
+  const doc = await parseYaml(readFileSync(target, "utf8"));
+  const provs = doc?.[0]?.config?.providers ?? {};
+  assert.deepEqual(Object.keys(provs).sort(), ["keep-me", "second"], `实际：${Object.keys(provs)}`);
+  assert.equal(provs["keep-me"].baseURL, "https://new.invalid/v1");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("inject-model 写进 4 空格缩进的文件：手写路由保留、缩进对齐", async () => {
+  const d = tmp();
+  const target = join(d, "cordis.patch.yml");
+  writeFileSync(target, INDENT4);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify({
+    model: "m", base: "https://example.invalid/v3",
+    summary: { contextWindow: 200000, outputCap: 65536, vision: false, thinkingSwitchable: [] },
+  }));
+  execFileSync(process.execPath, [join(ROOT, "scripts", "inject-model.mjs"),
+    "--patch", target, "--route", "custom-x", "--probe", probe, "--plugin-root", "/opt/dsh/node_modules"],
+  { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const doc = await parseYaml(readFileSync(target, "utf8"));
+  const provs = doc?.[0]?.config?.providers ?? {};
+  assert.ok("hand-route" in provs, `手写路由被吞：${Object.keys(provs)}`);
+  assert.ok("custom-x" in provs, `注入没生效：${Object.keys(provs)}`);
+  assert.equal(provs["custom-x"].baseURL, "https://example.invalid/v3");
   rmSync(d, { recursive: true, force: true });
 });

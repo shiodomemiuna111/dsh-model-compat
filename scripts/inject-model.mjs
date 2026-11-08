@@ -23,6 +23,7 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdtempSync, mkd
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
+import { locateProviders, removeRouteBlock, renderRouteYaml } from "../lib/yaml-edit.mjs";
 
 const require = createRequire(import.meta.url);
 const argv = process.argv.slice(2);
@@ -44,6 +45,15 @@ for (let i = 0; i < argv.length; i++) {
   else { console.error(`未知参数: ${a}`); process.exit(2); }
 }
 if (!o.patch || !o.route || !o.probe) { console.error("必须给 --patch / --route / --probe"); process.exit(2); }
+function numArg(name, v) {
+  if (v === undefined) return;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) { console.error(`--${name} 需要正整数，收到 "${v}"`); process.exit(2); }
+  return n;
+}
+o.headroom = numArg("headroom", String(o.headroom)) ?? 65536;
+o.maxOverride = numArg("max", o.maxOverride);
+o.assumeCtx = numArg("assume-ctx", o.assumeCtx);
 
 function loadYaml() {
   for (const t of ["yaml", "/opt/dsh/node_modules/yaml", o.pluginRoot ? `${dirname(dirname(o.pluginRoot))}/yaml` : null].filter(Boolean)) {
@@ -52,7 +62,18 @@ function loadYaml() {
   throw new Error("找不到 yaml 解析器（加 --plugin-root 或在 DSH 安装目录下运行）");
 }
 
-const probe = JSON.parse(readFileSync(o.probe, "utf8"));
+let probe;
+try { probe = JSON.parse(readFileSync(o.probe, "utf8")); }
+catch (e) { console.error(`读不了探测结果 ${o.probe}：${String(e?.message ?? e)}（文件不存在 / 不是 JSON）`); process.exit(2); }
+if (!probe || typeof probe !== "object" || Array.isArray(probe)) { console.error("探测结果必须是 JSON 对象（probe-capabilities --json 的输出）"); process.exit(2); }
+if (typeof probe.base !== "string" || probe.base.trim() === "") {
+  console.error("探测结果里没有 base（baseURL）。请不要手写 probe.json，用 probe-capabilities.mjs --json 生成。");
+  process.exit(2);
+}
+if (typeof probe.model !== "string" || probe.model.trim() === "") {
+  console.error("探测结果里没有 model。");
+  process.exit(2);
+}
 const s = probe.summary ?? {};
 const modelId = probe.model;
 
@@ -83,9 +104,9 @@ const fmt = switchable ? (s.switchFormat ?? null) : null;
 if (!fmt) console.error("提示：探测没证明这个端点能开/关思考，不写 compat（宁可少写，避免静默退化）。");
 // 只有真探测到「思考可开关」才写 compat；否则整块不写，别塞一个没证据的 supportsReasoningEffort。
 const effortProven = switchable && (s.thinkingSwitchable ?? []).some((v) => String(v).startsWith("reasoning_effort"));
-const compatBlock = fmt
-  ? `            compat:\n              thinkingFormat: ${fmt}${effortProven ? "\n              supportsReasoningEffort: true" : ""}\n`
-  : "";
+const compat = fmt
+  ? { thinkingFormat: fmt, ...(effortProven ? { supportsReasoningEffort: true } : {}) }
+  : null;
 
 // 压缩联动自检：不允许写一条注定被拒的声明
 const B = ctx - maxTokens;
@@ -106,34 +127,40 @@ if (problems.length && !o.force) {
 // api：探测脚本只会说 OpenAI 兼容协议（它自己就是按 /chat/completions 打的），
 // 绝不能拿 summary.accent（那是 thinkingFormat 的口味，如 "qwen"）当 api 写进 YAML。
 const apiKind = o.api ?? "openai-completions";
-const block = `      ${o.route}:
-        displayName: ${o.displayName ?? o.route}
-        api: ${apiKind}
-        baseURL: ${probe.base}
-        apiKeyEnv: ${o.apiKeyEnv ?? "YOUR_KEY_ENV"}
-        defaultInput: [text]
-        defaultMaxTokens: ${maxTokens}
-        models:
-          - id: ${modelId}
-            name: ${modelId}
-            contextWindow: ${ctx}
-            maxTokens: ${maxTokens}
-            input: [${input.join(", ")}]
-${compatBlock}            reasoningEfforts:
-              off: null
-              low: "low"
-              high: "high"
-`;
+const profile = {
+  displayName: o.displayName ?? o.route,
+  api: apiKind,
+  baseURL: probe.base,
+  apiKeyEnv: o.apiKeyEnv ?? "YOUR_KEY_ENV",
+  defaultInput: ["text"],
+  defaultMaxTokens: maxTokens,
+  models: [{
+    id: modelId,
+    name: modelId,
+    contextWindow: ctx,
+    maxTokens,
+    input,
+    ...(compat ? { compat } : {}),
+    reasoningEfforts: { off: null, low: "low", high: "high" },
+  }],
+};
 
 const YAML = loadYaml();
-let text = readFileSync(o.patch, "utf8");
+let text;
+try { text = readFileSync(o.patch, "utf8"); }
+catch (e) { console.error(`读不到 ${o.patch}：${String(e?.message ?? e)}`); process.exit(2); }
 
-// V6 幂等：如果托管块里已有同名路由（或旧注入留下同 id 的重复条目），先把它剥掉再插。
-// 旧版重复跑会产出 DUPLICATE_KEY，这是审计指出的问题。
-const dupRe = new RegExp(`^[ \\t]{6}${o.route.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:[ \\t]*\\n(?:[ \\t]{8,}.*\\n)*`, "gm");
-const before = text;
-text = text.replace(dupRe, "");
-if (text !== before) console.error(`提示：已移除旧的 ${o.route} 条目，按探测结果重新生成（幂等）。`);
+// 缩进从目标文件探测（4 空格缩进的文件也支持）
+let lines = text.split("\n");
+let anchor;
+try { anchor = locateProviders(lines); }
+catch (e) { console.error(`${String(e?.message ?? e)}`); process.exit(1); }
+lines = removeRouteBlock(lines, o.route, anchor.childIndent);
+if (lines.length !== text.split("\n").length) {
+  console.error(`提示：已移除旧的 ${o.route} 条目，按探测结果重新生成（幂等）。`);
+  text = lines.join("\n");
+}
+const block = renderRouteYaml(o.route, profile, anchor.childIndent, YAML) + "\n";
 const doc = YAML.parse(text);
 if (!Array.isArray(doc)) { console.error(`${o.patch} 顶层不是数组`); process.exit(2); }
 const entry = doc.find((e) => e?.id === "llm-pi-ai");
@@ -146,7 +173,7 @@ const merged = structuredClone(doc);
 const mEntry = merged.find((e) => e?.id === "llm-pi-ai");
 mEntry.config ??= {};
 mEntry.config.providers ??= {};
-mEntry.config.providers[o.route] = YAML.parse("providers:\n" + block).providers?.[o.route] ?? {};
+mEntry.config.providers[o.route] = profile;
 const tmp = mkdtempSync(join(tmpdir(), "inject-"));
 writeFileSync(join(tmp, "merged.yml"), YAML.stringify(merged));
 
@@ -181,10 +208,11 @@ const stamp = new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+/, "")
 let bak = `${o.patch}.bak-${stamp}`;
 for (let n = 1; existsSync(bak); n++) bak = `${o.patch}.bak-${stamp}-${n}`;
 copyFileSync(o.patch, bak);
-const anchorMatch = text.match(/^(\s*)- id: llm-pi-ai\b[\s\S]*?\n(\s*)providers:\n/m);
-if (!anchorMatch) { console.error("找不到 llm-pi-ai.providers: 位置，已放弃（文件未改）"); process.exit(1); }
-const insertAt = anchorMatch.index + anchorMatch[0].length;
-const updated = text.slice(0, insertAt) + block + text.slice(insertAt);
+const cur = text.split("\n");
+let at;
+try { at = locateProviders(cur); }
+catch (e) { console.error(`${String(e?.message ?? e)}（文件未改）`); process.exit(1); }
+const updated = [...cur.slice(0, at.line + 1), ...block.split("\n").slice(0, -1), ...cur.slice(at.line + 1)].join("\n");
 writeFileSync(o.patch, updated);
 // 写入后再验一次，不通过就回滚
 const post = (() => {

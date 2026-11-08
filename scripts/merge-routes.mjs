@@ -22,10 +22,11 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { staticAudit } from "../lib/audit.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
+import { locateProviders, removeRouteBlock, renderManagedBlock, findManagedBlock } from "../lib/yaml-edit.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const BEGIN_MARK = "# >>> managed-by-dsh-model-compat（以下由 merge-routes.mjs 维护，手改会被覆盖）";
+const BEGIN_MARK = "# >>> managed-by-dsh-model-compat";
 const END_MARK = "# <<< managed-by-dsh-model-compat";
 
 const o = { from: [], patch: null, dryRun: false, verify: true, pluginRoot: null };
@@ -169,7 +170,13 @@ for (const f of o.from) {
 }
 
 // ── 4. 冲突检测：目标文件里已有同名路由（且不在托管块内）
-const targetLines = readFileSync(o.patch, "utf8").split("\n");
+let targetText;
+try { targetText = readFileSync(o.patch, "utf8"); }
+catch (e) {
+  console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e)}\n（文件不存在 / 是目录 / 没有权限；不会改动任何东西）`);
+  process.exit(1);
+}
+const targetLines = targetText.split("\n");
 const targetProviders = {};
 {
   try {
@@ -182,9 +189,9 @@ const targetProviders = {};
 }
 const managedRouteNames = new Set();
 let managedBlock = null;
-try { managedBlock = findManaged(targetLines); } catch (e) { console.error(String(e?.message ?? e)); process.exit(1); }
+try { managedBlock = findManagedBlock(targetLines); } catch (e) { console.error(String(e?.message ?? e)); process.exit(1); }
 const childIndent = (() => {
-  try { return locateProviders(targetLines).indent; } catch { return null; }
+  try { return locateProviders(targetLines).childIndent; } catch { return null; }
 })();
 if (managedBlock && childIndent !== null) {
   const keyIndent = " ".repeat(childIndent);
@@ -208,88 +215,17 @@ for (const c of conflicts) {
   }
 }
 
-// ── 5. 渲染托管块
-function renderManaged(list, indent) {
-  if (list.length === 0) return "";
-  const pad = " ".repeat(indent);
-  const obj = Object.fromEntries(list.map((g) => [g.route, g.profile]));
-  const body = YAML.stringify({ providers: obj }).split("\n")
-    .filter((l) => l !== "" && l !== "providers:")
-    .map((l) => " ".repeat(Math.max(0, indent - 2)) + l)
-    .join("\n");
-  return `${pad}${BEGIN_MARK}\n${body}\n${pad}${END_MARK}`;
-}
-
-/** 找到 llm-pi-ai 条目下的 providers:，返回插入点与路由键缩进。不跨条目。 */
-function locateProviders(input) {
-  const lines = (Array.isArray(input) ? input : String(input).split("\n"));
-  let entryIndent = null;
-  let sawEntry = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const mEntry = line.match(/^([ \t]*)- id: llm-pi-ai[ \t]*$/);
-    if (mEntry) { entryIndent = mEntry[1].length; sawEntry = true; continue; }
-    if (!sawEntry) continue;
-    // 同缩进的另一个 `- id:` 表示 llm-pi-ai 条目已结束（修复隔离性问题）
-    if (entryIndent !== null && new RegExp(`^ {${entryIndent}}- `).test(line)) {
-      throw new Error("llm-pi-ai 条目里没有找到 providers:（在下一个条目之前就结束了）");
-    }
-    const mProv = line.match(/^([ \t]*)providers:[ \t]*$/);
-    if (mProv && mProv[1].length > entryIndent) {
-      return { line: i, indent: mProv[1].length + 2 };
-    }
-  }
-  throw new Error("找不到 llm-pi-ai.providers: 锚点（确认目标文件里有 '- id: llm-pi-ai' 且其 config 下有 providers:）");
-}
-
-/** 找托管块（必须行首、整行等于标记）。返回 {beginLine, endLine} 或 null。 */
-function findManaged(lines) {
-  const isBegin = (l) => l.replace(/^[ \t]*/, "") === BEGIN_MARK;
-  const isEnd = (l) => l.replace(/^[ \t]*/, "") === END_MARK;
-  let beginLine = -1;
-  for (let i = 0; i < lines.length; i++) if (isBegin(lines[i])) { beginLine = i; break; }
-  if (beginLine < 0) return null;
-  let endLine = -1;
-  for (let i = beginLine + 1; i < lines.length; i++) if (isEnd(lines[i])) { endLine = i; break; }
-  if (endLine < 0) throw new Error("托管块的开始标记存在但结束标记缺失（文件可能被手工改坏）");
-  return { beginLine, endLine };
-}
-
-/** 删掉一条块外路由（从它的键行起，到下一个缩进 ≤ 它的行之前）。 */
-function removeRouteLines(lines, routeName, childIndent) {
-  const keyIndent = " ".repeat(childIndent);
-  const out = lines.slice();
-  for (let i = 0; i < out.length; i++) {
-    if (out[i] !== `${keyIndent}${routeName}:`) continue;
-    let j = i + 1;
-    while (j < out.length) {
-      const l = out[j];
-      if (l.trim() === "") { j++; continue; }
-      const ind = l.length - l.replace(/^ +/, "").length;
-      if (ind < childIndent) break;
-      j++;
-    }
-    out.splice(i, j - i);
-    break;
-  }
-  return out;
-}
-
-function splice(text, render) {
+// ── 5. 渲染与写回（缩进从目标文件探测，见 lib/yaml-edit.mjs）
+function splice(text, list) {
   let lines = text.split("\n");
-  const { line, indent } = locateProviders(lines);
-  if (toRemove.length > 0) {
-    // 修复：路由键与 renderManaged 写出的缩进一致（= providers 的子缩进），
-    // 之前误用 indent-2 导致匹配不到、旧路由没删掉 → 写回后 Map keys must be unique。
-    for (const rn of toRemove) lines = removeRouteLines(lines, rn, indent);
-  }
-  const managed = findManaged(lines);
-  const block = render(indent);
+  const { line, childIndent } = locateProviders(lines);
+  for (const rn of toRemove) lines = removeRouteBlock(lines, rn, childIndent);
+  const block = renderManagedBlock(list, childIndent, YAML);
+  const managed = findManagedBlock(lines);
   if (managed) {
-    return [...lines.slice(0, managed.beginLine), ...block.split("\n"), ...lines.slice(managed.endLine + 1)].join("\n");
+    return [...lines.slice(0, managed.beginLine), ...block, ...lines.slice(managed.endLine + 1)].join("\n");
   }
-  // 插到 providers: 行之后
-  return [...lines.slice(0, line + 1), ...block.split("\n"), ...lines.slice(line + 1)].join("\n");
+  return [...lines.slice(0, line + 1), ...block, ...lines.slice(line + 1)].join("\n");
 }
 
 // ── 6. 报告
@@ -306,12 +242,17 @@ if (good.length === 0) {
   process.exit(1);
 }
 
-const target = readFileSync(o.patch, "utf8");
+let target;
+try { target = readFileSync(o.patch, "utf8"); }
+catch (e) {
+  console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e)}（文件不存在 / 是目录 / 没有权限）`);
+  process.exit(1);
+}
 const hasManaged = managedBlock !== null;
 
 let next = target;
 if (good.length > 0 || hasManaged) {
-  try { next = splice(target, (ind) => renderManaged(good, ind)); }
+  try { next = splice(target, good); }
   catch (e) { console.error(`生成失败（未改动文件）：${String(e?.message ?? e)}`); process.exit(1); }
   // 修复 C：写盘前的语法检查也在 try 内
   try {
@@ -340,7 +281,8 @@ function backupPath(base) {
   return p;
 }
 const bak = backupPath(o.patch);
-copyFileSync(o.patch, bak);
+try { copyFileSync(o.patch, bak); }
+catch (e) { console.error(`无法创建备份 ${bak}：${String(e?.message ?? e)}（目录只读？）未改动文件。`); process.exit(1); }
 
 function rollback(reason) {
   try { copyFileSync(bak, o.patch); } catch (e) { console.error(`回滚失败！${String(e?.message ?? e)}`); }

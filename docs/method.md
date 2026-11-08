@@ -37,7 +37,7 @@ DSH 的模型目录（`@earendil-works/pi-ai` 的 `dist/providers/data/*.json`�
 | 三种"关思考"写法 | `thinkingFormat` 选哪个 | 只有**真的能把 `reasoning_tokens` 归零**的写法才算 |
 | 1×1 PNG | `input` 要不要加 `image` | 200 且 prompt_tokens 上涨 / 有回答 |
 | 流式 SSE | UI 能否显示思考过程 | `delta` 里有没有 `reasoning_content` |
-| `--window` 二分 | `contextWindow` | 用**真实单词文本**递进，遇到 `context_length_exceeded` 收敛（见 pitfalls） |
+| `--window` 阶梯探测 | `contextWindow` | 用**真实单词文本**按固定阶梯递进，遇到 `context_length_exceeded` 停（不是二分；见 pitfalls） |
 
 ### 第 2 步：验（resolve-check.mjs）
 

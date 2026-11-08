@@ -64,6 +64,10 @@ function locatePlugin(roots) {
   for (const g of (process.env.DSH_GLOBAL_NODE_MODULES ?? "").split(":").filter(Boolean)) {
     candidates.push(`${g}/@deepseek-ai/dsh-llm-pi-ai`);
   }
+  // 常见 DSH 安装位置（npm -g 的 dsh、官方安装脚本的 /opt/dsh）
+  for (const nm of ["/opt/dsh/node_modules", "/usr/local/lib/node_modules", "/usr/lib/node_modules"]) {
+    candidates.push(`${nm}/@deepseek-ai/dsh-llm-pi-ai`);
+  }
   for (const c of candidates) {
     if (existsSync(`${c}/lib/index.js`) || existsSync(`${c}/lib/index.mjs`)) {
       const entry = existsSync(`${c}/lib/index.js`) ? `${c}/lib/index.js` : `${c}/lib/index.mjs`;
@@ -113,13 +117,14 @@ async function readYamlFile(file, pluginRoot) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.quiet && !args.json) console.log = () => {};
   if (args.help) {
     console.log("用法: node scripts/resolve-check.mjs [--patch file.yml ...] [--lint] [--budget] [--json] [--plugin-root DIR]");
     console.log("  --lint    逐条路由隔离 strict 解析，找出会拖垮整份配置的那一条");
     console.log("  --budget  计算压缩联动（threshold / retain / gap）");
     return 0;
   }
+  // 帮助优先：--quiet 只压正常输出，不吞 --help 与错误
+  if (args.quiet && !args.json) console.log = () => {};
   const plugin = locatePlugin(args.plugins);
 
   let failed = false;

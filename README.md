@@ -6,7 +6,7 @@
 > 窗口、模态、思考档位全都落到默认值（1M 上下文 / 128k 输出 / 只收文本），于是会出现
 > 「上下文突然爆」「说看不见图」「思考深度调不了」。**这不是 bug，是没声明。**
 
-本仓库提供 4 个零依赖的 Node 脚本，做三件事：
+本仓库提供 6 个零依赖的 Node 脚本，做三件事：
 
 1. **测**——用真实（便宜的）请求测出这个端点到底有什么能力；
 2. **验**——不启动 DSH，直接让 `dsh-llm-pi-ai` 的校验路径解析你写的 YAML，并顺带算压缩联动数字；
@@ -42,15 +42,16 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 
 ---
 
-## 五个脚本
+## 六个脚本
 
 | 脚本 | 花不花钱 | 干什么 |
 |---|---|---|
-| `probe-capabilities.mjs` | 几乎不花（默认 <1k token） | 打 /models、基础 chat、max_tokens 上限、思考开关、视觉、流式；`--window` 才做窗口二分（⚠ 每次几十万 token） |
+| `probe-capabilities.mjs` | 几乎不花（默认 <1k token） | 打 /models、基础 chat、max_tokens 上限、思考开关、视觉、流式；`--window` 才做窗口探测（固定阶梯，不是二分；⚠ 每次几十万 token） |
 | `resolve-check.mjs` | 不花钱 | 复制插件入口 + 追加一行 export，调用 `resolveProfiles(..., "strict")`，打印每条路由的真实解析结果；`--lint` 逐条隔离找出肇事路由；`--budget` 再算压缩联动 |
 | `context-budget.mjs` | 不花钱 | 单独算 threshold / retain / gap，反推「这个 maxTokens 至少要多大的 ctx」 |
 | `inject-model.mjs` | 不花钱 | 把探测结果安全写进 `cordis.patch.yml`：写入前隔离预演、写入后复验、失败自动回滚 |
 | `probe-matrix.mjs` | 不花钱（只装 npm 包） | 在 `/tmp` 里给每个历史版本搭隔离沙箱，跑同一份 YAML |
+| `merge-routes.mjs` | 不花钱 | 批量导入路由：逐条隔离验证 → 只写通过的 → 写后复验 → 失败回滚 |
 
 都没用第三方依赖；YAML 解析借用 DSH 自带的 `yaml` 包。
 
@@ -78,7 +79,7 @@ retain    = floor(B * retainRatio)      (默认 0.16)
 
 ## 跨版本兼容性（实测）
 
-同一份包含 3 条路由的 YAML，在 5 个版本的 `@deepseek-ai/dsh-llm-pi-ai` 上解析结果**完全一致**：
+同一份包含 2 条路由的 YAML，在 5 个版本的 `@deepseek-ai/dsh-llm-pi-ai` 上，**可比的四个字段（ctx / max / input / reasoning）逐字段一致**（`thinkingFormat`、`compat`、思考档位不在比对范围内，见 portability.md）：
 
 | 版本 | 发布 | 配套 pi-ai | 结果 |
 |---|---|---|---|
@@ -86,7 +87,7 @@ retain    = floor(B * retainRatio)      (默认 0.16)
 | 0.1.5-rc.3 | 2026-09-22 | ^0.85.1 | PASS |
 | 0.1.7-rc.2 | 2026-09-24 | ^0.85.1 | PASS |
 | 0.2.1-rc.5 | 2026-10-29 | ^1.1.0 | PASS |
-| 0.2.2-rc.1 | 2026-11-04 | ^1.5.0 | PASS |
+| 0.2.2-rc.1 | 2026-11-04 | ^1.3.0（实装 1.5.0） | PASS |
 
 原因：`providers` 字典格式、`reasoningEfforts` / `thinkingFormat` / `defaultInput` / `compat` 这些字段、
 `--patch` 覆盖层、`$DSH_HOME/profiles/<name>/cordis.patch.yml` 约定，从最早的 0.0.1-rc.5 就存在。
@@ -101,6 +102,7 @@ scripts/probe-capabilities.mjs   测端点能力
 scripts/resolve-check.mjs        验 YAML 能否被解析 + 压缩联动
 scripts/context-budget.mjs       纯计算压缩阈值
 scripts/inject-model.mjs         安全写入（预演→写入→复验→回滚）
+scripts/merge-routes.mjs         批量导入（单条失败不拖累全局）
 scripts/probe-matrix.mjs         跨版本沙箱复验
 examples/cordis.patch.yml        可直接抄的两种写法
 docs/method.md                   方法论：为什么不要抄厂商数字
@@ -121,8 +123,9 @@ DSH 的 strict 校验是「全体或全无」：**一条坏声明 → 整份配�
 
 > V6 勘误：旧版这里写「9 种坏法里有 3 种 strict 放行」是**错的**。DSH 真实加载是两段
 > （`Config()` 结构校验 + `resolveProfiles()` 语义校验），那 3 种第一段就拒了。
-> 唯一两层都静默的是**把 `compat` 写在路由层**（不报错也不生效）—— 由静态审计兜住。
-> 现在 `resolve-check.mjs` 两段都跑。
+> 另一个曾被写反的结论：**路由级 `compat` 是会生效的**（`index.js:627` 把它并进该路由下每个模型）；
+> 真正会静默丢的是**写在模型条目里的 `api` / `baseURL`**（只认路由层）和**拼错的未知字段**。
+> 现在 `resolve-check.mjs` 两段都跑，静态审计也覆盖这两类手误。
 
 两道闸门：
 
