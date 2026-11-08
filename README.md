@@ -112,3 +112,33 @@ docs/failure-modes.md            失败模式：一条坏声明会不会毒死�
 ## License
 
 MIT
+
+---
+
+## 批量导入端口：单条失败不拖累全局
+
+DSH 的 strict 校验是「全体或全无」：**一条坏声明 → 整份配置被拒 → 其它端口也全废。**
+实测 9 种坏法里，有 3 种是 strict **放行**但运行时才炸的（`thinkingFormat` 拼错、`input` 写了 `video`、
+`reasoningEfforts` 给了数字）。
+
+两道闸门：
+
+```bash
+# 1) 诊断：哪一条把整份配置毒死
+node scripts/resolve-check.mjs --lint
+
+# 2) 导入：逐路由隔离验证 → 只写入通过的 → 写后复验 → 失败自动回滚
+node scripts/merge-routes.mjs \
+  --patch ~/.dsh/profiles/web/cordis.patch.yml \
+  --from new-ports.yml --plugin-root /opt/dsh/node_modules
+```
+
+`merge-routes` 只写入自己维护的托管块（`# >>> managed-by-dsh-model-compat` … `# <<<`），
+块外的手写路由永不改动。详见 [docs/failure-modes.md](docs/failure-modes.md)。
+
+## 模型卡死
+
+DSH 自带三层兜底，不需要额外处理：流空闲看门狗（`streamIdleTimeoutMs`，默认 5 分钟无字节即判 TIMEOUT）、
+自动重试（`retryPolicy`：5 次 / 500ms 起指数退避 / 上限 10s）、手动 Esc。
+不可重试的错误（400 参数错、401）会立刻上抛，不会挂住。
+校验本身是纯本地的——**一个死掉的网关地址不会拖累其它路由的加载**。

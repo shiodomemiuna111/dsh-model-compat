@@ -15,6 +15,7 @@
  * 不修改 node_modules 里的任何原文件。
  */
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { staticAudit } from "../lib/audit.mjs";
 import { createRequire } from "node:module";
 import { resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +24,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 function parseArgs(argv) {
-  const out = { patches: [], json: false, plugins: [], budget: false, lint: false, headroom: 65536 };
+  const out = { patches: [], json: false, plugins: [], budget: false, lint: false, quiet: false, headroom: 65536 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--patch") out.patches.push(argv[++i]);
@@ -31,6 +32,7 @@ function parseArgs(argv) {
     else if (a === "--json") out.json = true;
     else if (a === "--budget") out.budget = true;
     else if (a === "--lint") out.lint = true;
+    else if (a === "--quiet") out.quiet = true;
     else if (a === "--headroom") out.headroom = Number(argv[++i]);
     else if (a === "-h" || a === "--help") out.help = true;
     else if (a.startsWith("-")) throw new Error(`unknown flag: ${a}`);
@@ -107,6 +109,7 @@ async function readYamlFile(file, pluginRoot) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.quiet && !args.json) console.log = () => {};
   if (args.help) {
     console.log("用法: node scripts/resolve-check.mjs [--patch file.yml ...] [--lint] [--budget] [--json] [--plugin-root DIR]");
     console.log("  --lint    逐条路由隔离 strict 解析，找出会拖垮整份配置的那一条");
@@ -177,6 +180,16 @@ async function main() {
     }
   }
 
+  // 2c) 静态审计：strict 放行但运行时会出事的写法
+  const audit = staticAudit(providers);
+  if (!args.json) {
+    if (audit.length === 0) console.log("静态审计：未发现 strict 放行的问题写法。");
+    else {
+      console.log(`静态审计：发现 ${audit.length} 处 strict 不会拦、但运行时会出事的地方：`);
+      for (const a of audit) console.log(`  ${a.level === "error" ? "✗" : "!"} ${a.msg}`);
+    }
+  }
+
   // 3) 严格解析（全体）
   let routes;
   try {
@@ -234,7 +247,7 @@ async function main() {
   }
 
   if (args.json) {
-    console.log(JSON.stringify({ ok: !failed, patches: loaded, models: report, ...(args.budget ? { budget } : {}), ...(lintReport ? { lint: lintReport } : {}) }, null, 2));
+    console.log(JSON.stringify({ ok: !failed && !audit.some((a) => a.level === "error"), audit, patches: loaded, models: report, ...(args.budget ? { budget } : {}), ...(lintReport ? { lint: lintReport } : {}) }, null, 2));
   } else {
     console.log(`插件: ${plugin.root}`);
     console.log(`补丁: ${loaded.join(", ")}`);
@@ -253,7 +266,7 @@ async function main() {
       }
     }
   }
-  return failed ? 1 : 0;
+  return failed || audit.some((a) => a.level === "error") ? 1 : 0;
 }
 
 const DEFAULT_PATCH =

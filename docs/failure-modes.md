@@ -1,89 +1,133 @@
-# 失败模式与自愈设计
+# 失败模式与兜底
 
-插件不会"自动发现并自动修正"——DSH 里这套声明是**静态配置**，没有一个后台线程替你试错。
-所以这个项目把"能不能自愈"拆成四个可验证的问题，每条结论都带实测命令。
+这份文档回答两个问题：**一条坏声明会不会拖累别的端口？模型卡死了怎么办？**
 
 ---
 
-## 1. 一条坏声明会不会毒死全部？
+## 一、单条坏声明 = 全盘失效（已实测，已修）
 
-**会，而且没有任何局部隔离。** `resolveProfiles(providers, "strict")` 在插件挂载时执行，
-任意一条抛错就整体 THROW，整份 `cordis.patch.yml` 被拒。实测：
+### 现象
 
-| 坏法 | strict 结果 | deferred 结果 |
-|---|---|---|
-| 某模型 `contextWindow: "128k"` | **THROW** `model "x" contextWindow must be a positive integer` | 该路由 `catalogError=true`，模型列表为空，**其它路由照常** |
-| 某模型 `reasoningEfforts: {}` | **THROW** `has an empty reasoningEfforts` | OK（该路由仍在但档位异常） |
-| 某模型 `compat.thinkingFormat: bogus` | PASS（**静默接受**） | PASS |
-| `input: ['video']` | PASS（**静默接受**，请求时才被上游拒） | PASS |
-| `baseURL: ""` / `displayName: ""` / 空 provider 名 | **THROW**（deferred 也 THROW，没有救） | THROW |
-| `defaultInput: []` | **THROW**（deferred 也 THROW） | THROW |
-| `models` 写成字符串 | **THROW** `Cannot read properties of undefined` | THROW |
+DSH 加载 `llm-pi-ai` 配置时用的是 **strict** 校验。strict 是「全体或全无」：
+一个 provider 的 `contextWindow` 写成 `"128k"`，整份 `cordis.patch.yml` 被拒——
+其余 9 个声明完全正确的端口也一起失效。
 
-**自愈手段**：`node scripts/resolve-check.mjs --patch your.yml --lint`
-逐路由隔离解析，直接告诉你是哪一条肇事的：
+实测（`resolve-check.mjs` 单独喂各种坏法）：
+
+| 坏法 | strict 行为 |
+|---|---|
+| `contextWindow: "128k"` | **THROW** 整份被拒 |
+| `maxTokens: 0` | **THROW** |
+| `reasoningEfforts: {}` | **THROW** |
+| `reasoningEfforts: {high: ""}` | **THROW** |
+| `baseURL: ""` / 空 provider 名 | **THROW** |
+| `input: []` | 不报错，但等于「没声明」，会继承 defaultInput |
+| `thinkingFormat: bogus` | **静默通过** ← 危险 |
+| `input: ["video"]` | **静默通过** ← 危险 |
+| `reasoningEfforts: {high: 123}` | **静默通过** ← 危险 |
+
+最后三行是真正的坑：**strict 放行，运行时才炸**。
+`thinkingFormat: bogus` 会被原样记进 `compat`，pi-ai 的 `if/else` 链匹配不上任何分支，
+于是**静默退化成 `reasoning_effort`，或者干脆不发任何思考字段**——你的模型看起来「不能调思考」，
+其实是字段名拼错了一个字母。
+
+### 修法：两层
+
+**第 1 层 —— `resolve-check.mjs --lint`**：逐条路由单独解析。
+哪一条把整份配置毒死，直接点名：
 
 ```
 逐路由隔离检查（strict，一条不过不会拖累别的）：
   ✓ custom-good [good-model]
-  ✗ custom-broken ← llm-pi-ai: provider "custom-broken" model "broken-model" contextWindow must be a positive integer
+  ✗ custom-broken ← contextWindow must be a positive integer
   ✓ custom-also-good [also-model]
 ```
 
-**唯一的"自动"**：`scripts/inject-model.mjs` 写入前先做隔离预演，预演不过拒绝写入；
-写入后再验一次，不过自动回滚到备份。堵住的正是"批量导入时一条坏数据弄崩全局"。
+**第 2 层 —— `merge-routes.mjs`（真正的批量导入）**：
+
+```bash
+node scripts/merge-routes.mjs \
+  --patch ~/.dsh/profiles/web/cordis.patch.yml \
+  --from new-ports.yml --plugin-root /opt/dsh/node_modules
+```
+
+流程：
+1. 在一个进程里跑完所有候选路由（先 strict 拿第一条错，再 deferred 逐条标记）；
+2. 通过的写进**托管块**，失败的列出来跳过；
+3. 写前 `.bak` 备份，写完整份文件复验，**复验不过自动回滚**。
+
+```
+候选 3 条：通过 1，失败 2
+  ✓ custom-import-good
+  ✗ custom-import-broken ← contextWindow must be a positive integer
+  ✗ custom-import-silent ← model "silent-model" input 含 "video"（只有 text/image 合法）
+
+失败的路由没有写进去，其余路由照常生效。
+✓ 已写入 cordis.patch.yml（备份 cordis.patch.yml.bak-...）
+```
+
+托管块的形状（块外的手写路由脚本永不改动）：
+
+```yaml
+    providers:
+      custom-manual: {...}        # 你的，脚本不碰
+      # >>> managed-by-dsh-model-compat（以下由 merge-routes.mjs 维护，手改会被覆盖）
+      custom-a: {...}
+      # <<< managed-by-dsh-model-compat
+```
+
+### 为什么不是「插件自动改配置」
+
+DSH 没有「插件加载失败 → 改写配置 → 重试」的钩子。`resolveProfiles` 在挂载时跑一次，
+结果要么进表、要么让挂载失败。**能做的不是自愈加载，而是把「写进去的声明一定是能加载的」。**
+`merge-routes` 就是这个闸门：先隔离验证，再合并，再复验，验不过回滚。
+声明错了不会自己好，但至少不会因为你其中一个端口写错、把已有的十个一起带走。
 
 ---
 
-## 2. 某个端口连不上，会不会拖慢全部？
+## 二、模型卡死
 
-**不会。** 路由校验是**纯本地**的：只检查字符串与数字，不碰网络。
-实测：把 `custom-111`（局域网 192.168.164.27，已经不可达）留在配置里，
-`resolve-check` 依然 3 条全 ✓，耗时不变。
+### 已有的三层兜底（读码确认，非猜测）
 
-连不上的代价只发生在**你切到那个模型并发起请求时**：
-`probe-capabilities.mjs` 实测报 `连不上 192.168.164.27:7863：UND_ERR_SOCKET`，退出码 1，不卡住。
+| 层 | 机制 | 默认值 |
+|---|---|---|
+| 流空闲看门狗 | `streamIdleTimeoutMs`：这么久没有新 token 就判 `TIMEOUT` | **300,000ms（5 分钟）** |
+| 自动重试 | `retryPolicy`：网络错误 / 429 / 5xx | **5 次**，500ms 起步、×2 退避、上限 10s、±10% 抖动 |
+| 手动 | `Esc` 中断、切换模型 | — |
 
----
+「卡死无法检测」这个担心，在 DSH 里对应的是**空转的流**，而它是有看门狗的：
+5 分钟没有任何字节就断，然后按 `retryPolicy` 重试（可重试错误才会重试）。
 
-## 3. 模型卡死不动怎么办？
+**不可重试的错误**（400 参数错、401 认证错、内容过滤）会立刻上抛，不会卡住等。
 
-三层，从里到外：
+**压缩会不会卡死？** 有一处真实边界：
+溢出恢复路径保留 0 条消息（`selectCompactableRange(session, measurement, 0)`），
+但如果此时**会话里只有一条消息、且紧挨着 system**，`keepFromIdx <= firstIdx` → 返回 null，
+压缩不了。此时只能 `/clear` 或换个更小的问题重来。这是设计边界，不是 bug。
 
-| 层 | 机制 | 默认值 | 怎么调 |
-|---|---|---|---|
-| 流空闲看门狗 | `streamIdleTimeoutMs`，超时抛 `TIMEOUT` | 300,000 ms（5 分钟） | 路由级字段，可写 60,000 收紧 |
-| 重试 | `retryPolicy`，默认 `mode: normal`、5 次、指数退避 500ms→10s、抖动 10%，重试 `TIMEOUT/TRANSPORT/RATE_LIMIT/SERVER/EMPTY_RESPONSE` | 5 次 | 路由级字段 |
-| 手动 | `Esc` 中断 / `handoff` | — | — |
+### 解析纯本地，网络挂起不拖累别人
 
-**注意**：看门狗判的是"**流里多久没有新 token**"，不是"整条回复多久"。
-推理型模型长思考时如果上游不推心跳，5 分钟无输出会被判 TIMEOUT——
-这是**故意的**：卡死就该断，而不是无限等。`probe-capabilities.mjs` 会测流式是否能通。
-
----
-
-## 4. 压缩会不会卡死？
-
-不会死锁，但有两个**真实边缘**：
-
-- **retain=0 的溢出路径**：上游 400 后 `selectCompactableRange(session, measurement, 0)`
-  保留 0 条，只留最后一条；注释原文 *overflow bypasses the normal threshold and retained-tail policy*。
-- **压缩不了的情形**：`keepFromIdx <= firstIdx` 直接返回 null——**只有一条消息、且紧挨着
-  system 消息**时没有可压缩的区间。这时溢出无法自愈，只能靠 `/clear` 换会话。
-- **工具配对被拆**：`toolPairingBalancedBefore` 会避免把 tool call 和 tool result 拆开，
-  所以压缩范围会回退到配对边界，极端情况下可能压得比预期少。
-
-**自愈手段**：`scripts/context-budget.mjs` 在改配置前就把 `pressure ≤ 0`、`retain ≥ threshold`、
-`gap < 30000` 挑出来（这三种是"自己把配置写坏"的路径）。
+不同 provider 的校验**不发任何网络请求**。实测：把那个已经死掉的局域网地址
+（`http://192.168.164.27:7863/v1`）留在配置里，其余路由照样全部 ✓。
+代价只在你**切到这个模型发第一条消息**的那一刻。
 
 ---
 
-## 5. 为什么不做真正的"自动发现 + 自动改写"？
+## 三、出问题时的排障顺序
 
-- DSH 的 `discoverModels` 只读窗口/输出上限，**明确不读模态与思考档位**
-  （源码注释：*nothing can interrogate a gateway for its modalities*）。
-- 实测两家网关的 `/models` 都不给能力字段（百炼只有 4 个字段，apizn 多个 endpoint 类型）。
-- 没有插件钩子能在"配置加载失败"时改写配置——挂了就是挂了。
+1. `node scripts/resolve-check.mjs --lint` —— 先排除「一条坏声明毒死全体」
+2. `node scripts/resolve-check.mjs --budget` —— 再排除压缩联动配错（`TargetPressureConfigError`）
+3. 实际发一条消息 —— 400 看它怎么说（`context_length_exceeded` / 不支持的字段 / 认证）
+4. 看思考是否真的开：开/关两次请求的 `reasoning_tokens` 有没有稳定差异
+5. 看不到图：先看 `input` 有没有 `image`，再看请求里有没有 image part
 
-所以定位很明确：**自动拿到能拿到的（窗口/输出上限），剩下的一次真实请求证明，写进声明，
-写完再验一遍、验不过回滚。** 这是工程上能做到的最接近"自愈"的闭环。
+---
+
+## 四、还没解决 / 已知限制
+
+- **插件失效不会自动修**：见上文，没有钩子。只能靠前置闸门。
+- **网关报的错不一定可信**：有的网关对所有 `reasoning_effort` 都返回 200（实测 apizn），
+  返回 200 不代表参数生效。
+- **窗口只能实测**：`/models` 在实测的两家里都不给窗口与模态。
+- **热重载失败会保留旧配置**：改 YAML 不用重启，但校验不过时旧配置继续生效、新配置不加载，
+  DSH 会给客户端一条通知。所以先用 `resolve-check` 离线验，再改文件。
