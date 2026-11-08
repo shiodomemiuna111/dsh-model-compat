@@ -1,0 +1,59 @@
+# ─────────────────────────────────────────────────────────────
+# dsh-model-compat 示例：给 DSH 接第三方 OpenAI 兼容端点
+#
+# 放法二选一：
+#   A. 整份复制到 $DSH_HOME/cordis.patch.yml（home 级覆盖层）
+#   B. 复制下面的条目，粘到你 profile 的 cordis.patch.yml 里，
+#      位置必须在 `- id: llm-pi-ai` 那一项之后（同 id 的后来者覆盖前者）
+#
+# 改完不用重启（dsh-hmr 会热重载），但重载校验失败会当场报错并保留旧配置。
+# key 的三种来源，任选其一：
+#   1. 环境变量（推荐）：apiKeyEnv: MY_KEY_ENV
+#   2. $DSH_HOME/.credentials.yaml 的 refs: 下写 MY_KEY_ENV: sk-xxx
+#   3. 走 DSH 设置页的 Models 页填写（会写进设置文档）
+# ─────────────────────────────────────────────────────────────
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      # ── 例 1：国内端点，Qwen 式思考开关，1M 窗口 ──────────────
+      custom-example-a:
+        displayName: 示例A
+        api: openai-completions
+        baseURL: https://api.example-a.com/v1
+        apiKeyEnv: EXAMPLE_A_KEY
+        defaultInput: [text]          # 没声明的模型默认只看文本，避免误发图被拒
+        defaultMaxTokens: 65536       # 没声明的模型默认输出上限
+        models:
+          - id: example-a-model
+            name: 示例A 模型
+            contextWindow: 800000     # 填实测值，用 scripts/probe-capabilities.mjs --window 测
+            maxTokens: 65536
+            input: [text, image]      # 实测能看图才写 image
+            compat:
+              thinkingFormat: qwen    # 发 enable_thinking；用 probe 脚本确认哪条能关思考
+              supportsReasoningEffort: true
+            reasoningEfforts:         # 只声明实测可复现的档位
+              off: null
+              low: "low"
+              high: "high"
+
+      # ── 例 2：国外端点，OpenAI 原生，不声明 thinkingFormat ────
+      custom-example-b:
+        displayName: 示例B
+        api: openai-completions
+        baseURL: https://api.example-b.com/v1
+        apiKeyEnv: EXAMPLE_B_KEY
+        defaultInput: [text]
+        defaultMaxTokens: 65536
+        models:
+          - id: example-b-model
+            name: 示例B 模型
+            contextWindow: 400000
+            maxTokens: 32768
+            input: [text, image]
+            compat:
+              supportsReasoningEffort: true   # OpenAI 原生：缺省就发 reasoning_effort
+            reasoningEfforts:
+              off: null
+              high: "high"

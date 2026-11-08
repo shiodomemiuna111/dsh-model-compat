@@ -1,0 +1,16 @@
+{
+  "name": "dsh-model-compat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Probe and declare third-party OpenAI-compatible model capabilities for DeepSeek Harness (dsh).",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "probe": "node scripts/probe-capabilities.mjs",
+    "check": "node scripts/resolve-check.mjs",
+    "budget": "node scripts/context-budget.mjs",
+    "matrix": "node scripts/probe-matrix.mjs",
+    "selfcheck": "node scripts/context-budget.mjs --ctx 800000 --max 65536 && node scripts/resolve-check.mjs --patch examples/cordis.patch.yml --plugin-root /opt/dsh/node_modules --budget"
+  },
+  "license": "MIT"
+}
