@@ -30,7 +30,10 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "-h" || a === "--help") { console.log("用法: context-budget.mjs --ctx N --max N [--headroom N] [--json]"); process.exit(0); }
   else { console.error(`未知参数: ${a}`); process.exit(2); }
 }
-if (!opt.ctx || !opt.max) { console.error("必须给 --ctx 和 --max"); process.exit(2); }
+// V6：--max 0 是合法的（未声明 maxTokens 时真实实现按 `maxTokens ?? 0` 处理，B=ctx）。
+// 旧版用 `!opt.max` 判空，把 0 也拒了 —— 审计发现的 bug。
+if (!Number.isFinite(opt.ctx) || opt.ctx <= 0) { console.error("必须给 --ctx（正整数）"); process.exit(2); }
+if (!Number.isFinite(opt.max) || opt.max < 0) { console.error("--max 必须是非负整数（0 = 未声明 maxTokens）"); process.exit(2); }
 
 const B = opt.ctx - opt.max;
 const pressure = B - opt.headroom;
@@ -39,7 +42,8 @@ const retain = Math.floor(B * opt.retainRatio);
 const gap = threshold - retain;
 const problems = [];
 if (pressure <= 0) problems.push(`pressure=${pressure} ≤ 0 → DSH 报 TargetPressureConfigError`);
-if (retain >= threshold) problems.push(`retain=${retain} ≥ threshold=${threshold} → 配置被拒`);
+// V6：retain>=threshold 在 pressure>0 且 ratio 正常时其实不可达，保留作为兜底断言。
+if (retain >= threshold) problems.push(`retain=${retain} ≥ threshold=${threshold} → 配置被拒（正常情况下不可达，出现说明参数异常）`);
 if (gap < opt.minGap) problems.push(`缓冲带 ${gap} < ${opt.minGap} → 压缩后会反复触发（抖动）`);
 
 // 反推：给定 headroom，ctx 至少要多大才能通过 pressure 约束

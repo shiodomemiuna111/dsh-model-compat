@@ -4,8 +4,12 @@
 
 ## 实测结论（2026-11-08）
 
-同一份包含 3 条路由的 `cordis.patch.yml`，交给 5 个版本的 `@deepseek-ai/dsh-llm-pi-ai` 解析，
-**解析结果逐字段完全一致**：
+> **V6 更正**：下表所说的「逐字段完全一致」**只比对了 4 个字段**
+> （`contextWindow` / `maxTokens` / `input` / `reasoning`）。
+> `thinkingFormat`、`compat`、思考档位（`thinkingLevelMap`）**没有进比对**
+> —— 所以旧版对这几项的兼容性仍是【未验】，别当成已证明。
+
+同一份包含 3 条路由的 `cordis.patch.yml`，交给 5 个版本的 `@deepseek-ai/dsh-llm-pi-ai` 解析：
 
 | 插件版本 | 发布日 | 配套 pi-ai | 结果 |
 |---|---|---|---|
@@ -13,9 +17,15 @@
 | `dsh-llm-pi-ai@0.1.5-rc.3` | 2026-09-22 | ^0.85.1 | PASS |
 | `dsh-llm-pi-ai@0.1.7-rc.2` | 2026-09-24 | ^0.85.1 | PASS |
 | `dsh-llm-pi-ai@0.2.1-rc.5` | 2026-10-29 | ^1.1.0 | PASS |
-| `dsh-llm-pi-ai@0.2.2-rc.1` | 2026-11-04 | ^1.5.0 | PASS |
+| `dsh-llm-pi-ai@0.2.2-rc.1` | 2026-11-04 | ^1.3.0（实装 1.5.0） | PASS |
 
 （复现：`node scripts/probe-matrix.mjs --patch your.yml`）
+（`@deepseek-ai/dsh` 0.2.2-rc.1 的 `package.json` 里写的是 `^1.3.0`，本机装的是 1.5.0；
+  旧版 `^1.5.0` 的说法是错的。）
+
+**环境说明（同样重要）**：上面的「旧版」沙箱里，`dsh-llm-pi-ai` 是真旧版，但其余
+`@deepseek-ai/*` 包是**软链到本机新版**的。这是「插件层跨版本」，不是「整机旧版」。
+真实旧版 DSH 可能还差别的包，这一点未验证。
 
 ## 为什么能用
 
@@ -26,8 +36,8 @@
 - **声明字段齐全**：`reasoningEfforts`、`thinkingFormat`、`defaultInput`、
   `defaultContextWindow`、`defaultMaxTokens`、`compat`、`input`、`name`、`apiKeyEnv`
   在 0.0.1-rc.5 到 0.2.2-rc.1 全部存在。
-- **`thinkingFormat: qwen`** 从最老版本就有（0.0.1-rc.5 支持 9 种格式，
-  新版多出 `baseten` / `chat-template` / `qwen-chat-template`）。
+- **`thinkingFormat: qwen`** 从最老版本就有（0.0.1-rc.5 实际支持 **8** 种格式，
+  新版 11 种，多出 `baseten` / `chat-template` / `qwen-chat-template`）。
   三种协议（`openai-completions` / `openai-responses` / `anthropic-messages`）各版本一致。
 - **覆盖层约定一致**：`$DSH_HOME/profiles/<name>/cordis.patch.yml` 与 `--patch extra.yml`
   在 0.1.7-rc.2 和 0.2.2-rc.1 的 `lib/bin.js` 里说明文字完全相同；

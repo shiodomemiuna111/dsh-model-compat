@@ -2,7 +2,8 @@
 
 ## 1. 别用重复字符串测窗口
 
-`"x".repeat(8000000)` 会被上游 tokenizer 严重低估——实测 8M 个 `x` 只算 **1.8M token**。
+`"x".repeat(8000000)` 会被上游 tokenizer 严重低估——实测 8M 个 `x` 上报的 prompt_tokens
+远小于字符数（具体倍数依赖该网关的 tokenizer，**这个数字是【未验】的单一观测，别当常数用**）。
 用真实单词文本（如 `alpha beta gamma …`）才稳定：约 23 字符 ≈ 5.1 token。
 
 ## 2. `/models` 不是能力来源
@@ -59,5 +60,6 @@ DSH 直接报 `TargetPressureConfigError`。而 headroom 默认就是 65536，
 ## 9. 热重载会校验，失败当场报错
 
 改 `cordis.patch.yml` 不用重启（`dsh-hmr` 监听该文件），但重载时会走严格校验；
-校验不过会**当场失败并保留旧配置**，正在进行的会话可能被打断。
+校验不过会**当场失败**（行为是读码推断：`dsh-hmr/lib/index.js:850-872` 监听 patch 文件、
+重载走 `internal/config` 校验；「保留旧配置」这一点本机没有可复现案例，标【未验】）。
 所以先用 `resolve-check.mjs` 离线验，再改文件。

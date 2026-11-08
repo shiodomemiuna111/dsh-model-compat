@@ -37,6 +37,9 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--display-name") o.displayName = next();
   else if (a === "--dry-run") o.dryRun = true;
   else if (a === "--force") o.force = true;
+  else if (a === "--assume-ctx") o.assumeCtx = next();
+  else if (a === "--max") o.maxOverride = next();
+  else if (a === "--api") o.api = next();
   else if (a === "-h" || a === "--help") { console.log("用法见 scripts/inject-model.mjs 顶部注释"); process.exit(0); }
   else { console.error(`未知参数: ${a}`); process.exit(2); }
 }
@@ -52,11 +55,32 @@ function loadYaml() {
 const probe = JSON.parse(readFileSync(o.probe, "utf8"));
 const s = probe.summary ?? {};
 const modelId = probe.model;
-const ctx = Math.max(Number(s.contextWindow) || 1000000, 1000000);
-const maxTokens = Math.min(Number(s.outputCap) || 65536, 65536);
+
+// V6：不再"往大里凑"。审计指出旧版 Math.max(ctx,1e6) / Math.min(max,65536) 与
+// method.md 的「填实测值、宁小勿大」直接冲突，还会给非通义网关硬塞 thinkingFormat: qwen。
+// 现在：一律用探测到的值；没探测到就拒绝，要求显式 --assume-*（并在报告里标成【未验】）。
+function need(name, value, assume) {
+  if (value !== null && value !== undefined && Number.isFinite(Number(value)) && Number(value) > 0) return Number(value);
+  if (assume !== undefined && Number.isFinite(Number(assume)) && Number(assume) > 0) {
+    console.error(`警告：${name} 未探测到，使用 --assume-${name}=${assume}（这是假设值，不是实测值）`);
+    return Number(assume);
+  }
+  console.error(`拒绝写入：探测结果里没有 ${name}。`);
+  console.error(`  真实窗口只能用 probe-capabilities.mjs 的大输入探测得到；量不到就显式给 --assume-${name} <值>。`);
+  console.error(`  （不要用 1000000 兜底 —— 那是"猜的"，会让压缩阈值算错。）`);
+  process.exit(1);
+}
+o.assumeCtx ??= undefined;
+const ctx = need("contextWindow", s.contextWindow, o.assumeCtx);
+const probeMax = s.outputCap;
+if (probeMax === null || probeMax === undefined) console.error("警告：输出上限未探测到，退回 --max（默认 65536，保守值）");
+const maxTokens = Math.min(Number(probeMax) || o.maxOverride || 65536, 65536);
 const input = ["text", ...(s.vision ? ["image"] : [])];
 const switchable = Array.isArray(s.thinkingSwitchable) && s.thinkingSwitchable.length > 0;
-const fmt = s.switchFormat ?? (switchable ? "qwen" : null);
+
+// thinkingFormat：只认探测给出的 switchFormat；没有证据就**不写**这个字段（宁可少写）。
+const fmt = switchable ? (s.switchFormat ?? null) : null;
+if (!fmt) console.error("提示：探测没证明这个端点能开/关思考，不写 thinkingFormat（宁可少写，避免静默退化）。");
 const compatBlock = fmt
   ? `            compat:\n              thinkingFormat: ${fmt}\n              supportsReasoningEffort: true\n`
   : `            compat:\n              supportsReasoningEffort: true\n`;
@@ -77,9 +101,11 @@ if (problems.length && !o.force) {
   process.exit(1);
 }
 
+// api：用探测记录的真实协议；没有就要求显式给
+const apiKind = o.api ?? s.accent ?? probe.summary?.api ?? "openai-completions";
 const block = `      ${o.route}:
         displayName: ${o.displayName ?? o.route}
-        api: openai-completions
+        api: ${apiKind}
         baseURL: ${probe.base}
         apiKeyEnv: ${o.apiKeyEnv ?? "YOUR_KEY_ENV"}
         defaultInput: [text]
@@ -96,8 +122,15 @@ ${compatBlock}            reasoningEfforts:
               high: "high"
 `;
 
-const text = readFileSync(o.patch, "utf8");
 const YAML = loadYaml();
+let text = readFileSync(o.patch, "utf8");
+
+// V6 幂等：如果托管块里已有同名路由（或旧注入留下同 id 的重复条目），先把它剥掉再插。
+// 旧版重复跑会产出 DUPLICATE_KEY，这是审计指出的问题。
+const dupRe = new RegExp(`^[ \\t]{6}${o.route.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:[ \\t]*\\n(?:[ \\t]{8,}.*\\n)*`, "gm");
+const before = text;
+text = text.replace(dupRe, "");
+if (text !== before) console.error(`提示：已移除旧的 ${o.route} 条目，按探测结果重新生成（幂等）。`);
 const doc = YAML.parse(text);
 if (!Array.isArray(doc)) { console.error(`${o.patch} 顶层不是数组`); process.exit(2); }
 const entry = doc.find((e) => e?.id === "llm-pi-ai");
@@ -141,8 +174,9 @@ if (o.dryRun) {
 }
 
 // ── 真正的文本插入：插在 llm-pi-ai 的 providers: 之后（保留注释与格式）
-const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
-const bak = `${o.patch}.bak-${stamp}`;
+const stamp = new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+/, "");
+let bak = `${o.patch}.bak-${stamp}`;
+for (let n = 1; existsSync(bak); n++) bak = `${o.patch}.bak-${stamp}-${n}`;
 copyFileSync(o.patch, bak);
 const anchorMatch = text.match(/^(\s*)- id: llm-pi-ai\b[\s\S]*?\n(\s*)providers:\n/m);
 if (!anchorMatch) { console.error("找不到 llm-pi-ai.providers: 位置，已放弃（文件未改）"); process.exit(1); }

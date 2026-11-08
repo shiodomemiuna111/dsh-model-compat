@@ -10,12 +10,16 @@
  *
  * 退出码：0 = 全部通过；1 = 有路由解析失败；2 = 用法/环境错误
  *
- * 原理：dsh-llm-pi-ai 的 validate 路径导出 resolveProfiles，但正式入口没导出它。
+ * 原理：真实加载路径是两段 —— `Config(raw)`（schemastery 结构校验，index.js:1086/:2940）
+ * 再 `resolveProfiles(..., "deferred")`（语义校验，index.js:1120）。V6 起两段都跑，
+ * 只跑后者会把「Config 会拒」的坏值误报成静默放行。resolveProfiles 正式入口没导出，
+ * 这里把 lib/index.js 复制成临时文件、补一行 export 再 import；退出时删除。
  * 这里把 lib/index.js 复制成临时文件、补一行 export，再 import 调用；退出时删除。
  * 不修改 node_modules 里的任何原文件。
  */
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { staticAudit } from "../lib/audit.mjs";
+import { verifyLoadPath } from "../lib/load-path.mjs";
 import { createRequire } from "node:module";
 import { resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -118,21 +122,9 @@ async function main() {
   }
   const plugin = locatePlugin(args.plugins);
 
-  // 1) 生成探针：复制入口文件 + 追加 export
-  const probeFile = `${plugin.root}/lib/__resolve-check-probe.mjs`;
-  const body = readFileSync(plugin.entry, "utf8");
-  writeFileSync(probeFile, `${body}\nexport { resolveProfiles };\n`);
+  let failed = false;
 
-  let resolveProfiles;
-  try {
-    ({ resolveProfiles } = await import(`${probeFile}?t=${Date.now()}`));
-  } finally {
-    try { unlinkSync(probeFile); } catch {}
-  }
-  if (typeof resolveProfiles !== "function") {
-    throw new Error("该版本的 dsh-llm-pi-ai 没有导出 resolveProfiles（过低或过高）");
-  }
-
+  // 1) 两段加载路径校验（Config → resolveProfiles），探针由 verifyLoadPath 内部管理并清理
   // 2) 合并补丁层里的 llm-pi-ai.providers
   const patches = args.patches.length ? args.patches : [DEFAULT_PATCH];
   let providers = {};
@@ -153,30 +145,32 @@ async function main() {
     throw new Error(`补丁层里没有 llm-pi-ai.providers：${loaded.join(", ")}`);
   }
 
-  // 2b) 隔离 lint：逐条路由单独 strict 解析，定位"是哪一条把整份配置毒死了"
+  // 2b) 隔离 lint：逐条路由单独跑两段加载路径，定位"是哪一条把整份配置毒死了"
   let lintReport = null;
   if (args.lint) {
     lintReport = [];
     for (const [route, profile] of Object.entries(providers)) {
       let ok = true, msg = null, models = [];
       try {
-        const one = await resolveProfiles({ [route]: profile }, "strict");
-        for (const [, r] of one) models = (await r.piProvider.getModels()).map((m) => m.id);
+        const one = await verifyLoadPath(plugin.root, { [route]: profile }, "strict");
+        const r = one.routes[route];
+        if (!one.schema.ok) { ok = false; msg = `Config 层：${one.schema.error}`; }
+        else if (!one.semantic.ok) { ok = false; msg = `语义层：${one.semantic.error}`; }
+        else if (!r || r.error) { ok = false; msg = r?.error ?? "解析失败"; }
+        else models = r.models;
       } catch (e) {
         ok = false;
-        msg = String(e?.message ?? e).slice(0, 160);
+        msg = String(e?.message ?? e).slice(0, 200);
       }
       lintReport.push({ route, ok, models, error: msg });
     }
     const bad = lintReport.filter((r) => !r.ok);
-    if (args.json) {
-      // JSON 分支统一在最后输出，这里只记录
-    } else {
-      console.log("逐路由隔离检查（strict，一条不过不会拖累别的）：");
+    if (!args.json) {
+      console.log("逐路由隔离检查（Config + 语义，一条不过不会拖累别的）：");
       for (const r of lintReport) {
         console.log(`  ${r.ok ? "✓" : "✗"} ${r.route}${r.ok ? ` [${r.models.join(", ")}]` : ` ← ${r.error}`}`);
       }
-      if (bad.length) console.log(`  注意：真实 DSH 的 strict 校验是"全体或全无"，上面 ${bad.length} 条失败会让整份配置被拒；` + `去掉它们或单独分一个 patch 层即可。`);
+      if (bad.length) console.log(`  注意：真实 DSH 的校验是"全体或全无"，上面 ${bad.length} 条失败会让整份配置被拒；` + `去掉它们或单独分一个 patch 层即可。`);
     }
   }
 
@@ -190,38 +184,42 @@ async function main() {
     }
   }
 
-  // 3) 严格解析（全体）
-  let routes;
-  try {
-    routes = await resolveProfiles(providers, "strict");
-  } catch (err) {
-    console.error(`解析失败（strict）：${err?.message ?? err}`);
+  // 3) 严格解析（全体）：先 Config，再语义
+  const whole = await verifyLoadPath(plugin.root, providers, "strict");
+  if (!whole.schema.ok) {
+    console.error(`Config 层拒绝（整份）：${whole.schema.error}`);
+    console.error(`提示：这正是 V5 及以前漏掉的一段；加 --lint 可逐条定位。`);
+    failed = true;
+  }
+  if (!whole.semantic.ok) {
+    console.error(`语义层拒绝（整份）：${whole.semantic.error}`);
     if (lintReport) {
       const bad = lintReport.filter((r) => !r.ok);
       if (bad.length) console.error(`肇事路由：${bad.map((r) => r.route).join(", ")}`);
     } else {
       console.error(`提示：加 --lint 可以逐条隔离，找出是哪一条把整份配置毒死了。`);
     }
-    return 1;
+    failed = true;
+  }
+  if (failed && !args.json && !args.lint) return 1;
+
+  // 逐路由结果（deferred 语义下拿到的完整清单）
+  const routes = new Map();
+  {
+    const probe = await verifyLoadPath(plugin.root, providers, "deferred");
+    for (const [route, r] of Object.entries(probe.routes)) {
+      routes.set(route, r);
+    }
   }
 
   const report = [];
-  let failed = false;
   for (const [route, resolved] of routes) {
-    const models = await resolved.piProvider.getModels();
-    const errors = [...(resolved.modelErrors?.entries?.() ?? [])].map(([id, msg]) => ({ id, msg: String(msg).slice(0, 200) }));
-    if (errors.length && (resolved.modelErrors?.size ?? 0) > 0) failed = true;
-    const rows = models.map((m) => ({
-      route,
-      id: m.id,
-      contextWindow: m.contextWindow ?? null,
-      maxTokens: m.maxTokens ?? null,
-      input: m.input ?? null,
-      reasoning: Boolean(m.reasoning),
-      levels: m.thinkingLevelMap ?? null,
-      thinkingFormat: m.compat?.thinkingFormat ?? null,
-    }));
-    report.push(...rows, ...errors.map((e) => ({ route, error: e.msg })));
+    if (resolved.error) {
+      failed = true;
+      report.push({ route, error: String(resolved.error).slice(0, 300) });
+      continue;
+    }
+    for (const d of resolved.details ?? []) report.push({ route, ...d });
   }
 
   // 可选：检查压缩联动数字（阈值/保留/缓冲带）

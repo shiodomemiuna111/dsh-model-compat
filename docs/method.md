@@ -75,7 +75,7 @@ DSH 的模型目录（`@earendil-works/pi-ai` 的 `dist/providers/data/*.json`�
             maxTokens: 65536         # 故意低于真实上限，避免单次回复吃掉太多预算
             input: [text, image]     # 实测能看图才写
             compat:
-              thinkingFormat: qwen   # 有"可关"证据才写
+              thinkingFormat: qwen   # 只有探测到"能开/关思考"的证据才写；没有就不写
             reasoningEfforts:        # 只声明实测可复现的档位
               off: null
               low: "low"

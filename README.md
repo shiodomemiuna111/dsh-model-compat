@@ -118,8 +118,11 @@ MIT
 ## 批量导入端口：单条失败不拖累全局
 
 DSH 的 strict 校验是「全体或全无」：**一条坏声明 → 整份配置被拒 → 其它端口也全废。**
-实测 9 种坏法里，有 3 种是 strict **放行**但运行时才炸的（`thinkingFormat` 拼错、`input` 写了 `video`、
-`reasoningEfforts` 给了数字）。
+
+> V6 勘误：旧版这里写「9 种坏法里有 3 种 strict 放行」是**错的**。DSH 真实加载是两段
+> （`Config()` 结构校验 + `resolveProfiles()` 语义校验），那 3 种第一段就拒了。
+> 唯一两层都静默的是**把 `compat` 写在路由层**（不报错也不生效）—— 由静态审计兜住。
+> 现在 `resolve-check.mjs` 两段都跑。
 
 两道闸门：
 
