@@ -13,6 +13,13 @@
 3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效；
 4. **上线后对账 + 自动修正**——从真实会话记录里查「声明 vs 实际」，按探针结果重算并安全改写，全程留 JSONL 日志（含「上次为什么失败」）。
 
+> **v0.4.3**（装上 DSH，可以直接跑）：不再是「克隆下来手动 npm test」的仓库，而是**装进环境就能用**：
+> - `npm link` 之后有 8 个命令：`dmc-probe` / `dmc-check` / `dmc-verify` / `dmc-repair` / `dmc-merge` / `dmc-budget` / `dmc-matrix` / `dmc-inject`。
+> - `dmc-check` 不给 `--patch` 时**默认检查本机真实 profile**（`$DSH_HOME/profiles/web/cordis.patch.yml`），不再默认跑示例文件。
+> - 运行日志默认落到 `$DSH_HOME/dsh-model-compat.log.jsonl`（从任何目录跑都不散落文件），可用 `DSH_MODEL_COMPAT_LOG` 覆盖。
+>
+> 安装：`git clone <repo> ~/.dsh/tools/dsh-model-compat && cd ~/.dsh/tools/dsh-model-compat && npm link`。更新：`git pull`（npm link 是软链，不用重装）。
+
 > **v0.4.2**（第五轮三份审计后的修复）：三名审计员（对抗破坏 / 照文档敲 / 机制核验）在 v0.4.1 上报了 **1 个 P0 + 6 个 P1 + 10 个 P2/P3**，全部成立并已修：
 > - **P0**：探针自己证明「开不了思考」，`--yaml` 片段却仍写 `reasoningEfforts {off, high}`——`resolve-check` 全绿、DSH 能加载，但 pi-ai 实发 `reasoning_effort`，strict 网关**每次请求 400**。根因是默认关时 `canDisable` 恒为 true；现在默认关必须证明「开得起来」才算可关，无开关证据就写 `reasoningEfforts: false`。组 24 用 plain mock 锁死。
 > - **P1**：①BOM 补丁永远报「被另一个进程改过」——指纹改用原始字节；②429 TPM 的 `too many tokens` 被当成窗口铁证——先排除限流，铁证只认**错误文本里服务端自报的窗口**；③窗口分类按 pi-ai `overflow.js` 的 27 条重写（DashScope `Range of input length…` 等 11 条此前漏判）；④档位判据改**每档 3 次交错采样 + 区间分离**（`min(high) ≥ max(low)×1.5`），无因果网关误判从 ~10.8% 降下来；⑤中文超限原文不再被静默丢弃。
