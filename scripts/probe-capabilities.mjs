@@ -31,6 +31,7 @@
  * 退出码：0 成功；1 关键步骤失败；2 用法错误
  */
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { buildSnippet } from "../lib/snippet.mjs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -243,29 +244,20 @@ async function main() {
 
   // 汇总成可粘贴的 YAML
   const supportsReasoning = switchable.length > 0;
-  const levels = supportsReasoning
-    ? `            reasoningEfforts:\n              off: null\n              low: "low"\n              high: "high"\n`
-    : `            reasoningEfforts: false\n`;
+  // 思考格式只按「哪个写法真能把 reasoning_tokens 归零」推断；推不出就不写 compat。
   const switchFormat = switchable.length === 0 ? null
     : switchable.some((v) => String(v).startsWith("enable_thinking")) ? "qwen"
     : switchable.some((v) => String(v).startsWith("thinking")) ? "deepseek"
     : "openai";
-  const yamlSnippet = `      custom-${new URL(o.base).hostname.replace(/\./g, "-")}:
-        displayName: ${new URL(o.base).hostname}
-        api: openai-completions
-        baseURL: ${o.base}
-        apiKeyEnv: YOUR_KEY_ENV
-        defaultInput: [text]
-        defaultMaxTokens: 65536
-        models:
-          - compat:
-              thinkingFormat: ${switchFormat}        # 按探测到的开关字段写；探测不到就删掉这行
-            id: ${o.model}
-            name: ${o.model}
-            contextWindow: ${contextWindow ?? 1000000}
-            maxTokens: ${maxTokens ?? 65536}
-            input: [text${visionOk ? ", image" : ""}]
-${levels}`;
+  const yamlSnippet = buildSnippet({
+    base: o.base,
+    model: o.model,
+    contextWindow,
+    maxTokens,
+    visionOk,
+    switchFormat,
+    reasoningSwitchable: supportsReasoning,
+  });
   findings.yaml = yamlSnippet;
   findings.summary = {
     listedInModels: listed,

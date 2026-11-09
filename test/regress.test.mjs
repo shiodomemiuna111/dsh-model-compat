@@ -599,3 +599,72 @@ test("inject-model 写进 4 空格缩进的文件：手写路由保留、缩进�
   assert.equal(provs["custom-x"].baseURL, "https://example.invalid/v3");
   rmSync(d, { recursive: true, force: true });
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 9：--yaml 片段生成（审计：旧版在「没证据」时会产出被拒的配置）
+//   - 探测不到思考开关 → 旧版输出 `thinkingFormat: null`，真实解析报 "with no value"
+//   - 没测窗口 → 旧版输出 contextWindow: 1000000（正是本方案反对的抄兜底值）
+// ═══════════════════════════════════════════════════════════════════════
+
+test("片段：没有思考证据时不写 compat 块（旧版会写 thinkingFormat: null → 解析被拒）", async () => {
+  const { buildSnippet } = await import("../lib/snippet.mjs");
+  const text = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: 400000, maxTokens: 65536, visionOk: false, switchFormat: null, reasoningSwitchable: false });
+  assert.doesNotMatch(text, /compat:/);
+  assert.doesNotMatch(text, /thinkingFormat:/);
+  assert.match(text, /reasoningEfforts: false/);
+});
+
+test("片段：没测窗口时用保守占位而不是 1000000，并带警告注释", async () => {
+  const { buildSnippet, UNMEASURED_CONTEXT_WINDOW } = await import("../lib/snippet.mjs");
+  const text = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: null, maxTokens: null, visionOk: false, switchFormat: null, reasoningSwitchable: false });
+  assert.match(text, /contextWindow: 200000/);
+  assert.equal(UNMEASURED_CONTEXT_WINDOW, 200000);
+  assert.doesNotMatch(text, /contextWindow: 1000000/);
+  assert.match(text, /没测/);
+  assert.match(text, /maxTokens: 65536/);
+});
+
+test("片段：有无证据两种形态都能通过两段加载 + 压缩联动", skipIfNoPlugin, async () => {
+  const { buildSnippet } = await import("../lib/snippet.mjs");
+  const d = tmp();
+  const head = `- id: llm-pi-ai\n  name: "@deepseek-ai/dsh-llm-pi-ai"\n  config:\n    providers:\n`;
+  const cases = {
+    "no-evidence": { contextWindow: null, maxTokens: null, visionOk: false, switchFormat: null, reasoningSwitchable: false },
+    "measured": { contextWindow: 400000, maxTokens: 65536, visionOk: true, switchFormat: "qwen", reasoningSwitchable: true },
+  };
+  for (const [name, c] of Object.entries(cases)) {
+    const f = join(d, `${name}.yml`);
+    writeFileSync(f, head + buildSnippet({ base: "https://x.invalid/v1", model: "m", ...c }));
+    const r = execFileSync(process.execPath, [join(ROOT, "scripts", "resolve-check.mjs"), "--patch", f, "--lint", "--budget"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    assert.match(r, /✓ custom-x-invalid \/ m/, `${name}: ${r.slice(0, 400)}`);
+  }
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("反证：旧模板的 thinkingFormat: null 会被真实解析拒绝（这就是必须修的原因）", skipIfNoPlugin, () => {
+  const d = tmp();
+  const f = join(d, "old.yml");
+  writeFileSync(f, `- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      custom-old:
+        api: openai-completions
+        baseURL: https://x.invalid/v1
+        models:
+          - compat:
+              thinkingFormat: null
+            id: m
+            contextWindow: 200000
+            maxTokens: 65536
+`);
+  let code = 0, out = "";
+  try {
+    execFileSync(process.execPath, [join(ROOT, "scripts", "resolve-check.mjs"), "--patch", f], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) { code = e.status ?? 1; out = `${e.stdout ?? ""}${e.stderr ?? ""}`; }
+  assert.equal(code, 1, out);
+  assert.match(out, /with no value/);
+  rmSync(d, { recursive: true, force: true });
+});
