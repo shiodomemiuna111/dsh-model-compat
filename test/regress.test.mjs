@@ -1718,3 +1718,31 @@ test("组 22：repair --apply 不许抹掉路由上的 headers / retryPolicy / t
   assert.match(after, /transport: sse/);
   assert.match(after, /displayName: r1/);
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 23（v0.4.1）：会话里用过、但补丁里已经没有的模型不能被静默忽略
+// ═══════════════════════════════════════════════════════════════════════
+test("verify-effective：用过但配置里已没有的模型要单独列出（不能静默丢掉证据）", async () => {
+  const { zstdCompressSync } = await import("node:zlib");
+  const { mkdirSync } = await import("node:fs");
+  const d = tmp();
+  const sessions = join(d, "sessions");
+  const sdir = join(sessions, "--root-workspace--", "session-orphan");
+  mkdirSync(sdir, { recursive: true });
+  const events = [
+    { type: "request/context", data: { provider: "peek", model: "ghost", contextWindow: 131072 } },
+    { type: "request/header", data: { header: { config: { provider: "peek", model: "ghost" } } } },
+    { type: "assistant/message", data: { usage: { inputTokens: 5000 }, message: { content: [{ type: "text", text: "hi" }] } } },
+  ];
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      custom-x:\n        api: openai-completions\n        baseURL: https://x.invalid/v1\n        models:\n          - id: m\n            contextWindow: 1000000\n            maxTokens: 128000\n            input: [text]\n`);
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr?.slice(0, 400));
+  const out = JSON.parse(r.stdout);
+  const orphan = out.rows.find((x) => x.orphan === true);
+  assert.ok(orphan, `应当列出孤儿模型：${r.stdout.slice(0, 600)}`);
+  assert.equal(orphan.model, "ghost");
+  assert.equal(orphan.verdict, "配置里已没有这个模型");
+  assert.match(orphan.warnings.join(" "), /当前补丁里没有任何路由声明它/);
+});

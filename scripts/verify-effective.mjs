@@ -234,11 +234,15 @@ function classifyFailure(msg) {
 export function reconcile({ facts, providers, compaction }) {
   const rows = [];
   const problems = [];
+  // v0.4.1：会话里用过、但当前补丁里**已经没有**的 provider/model 不能静默忽略
+  // （改路由名、删模型、被别的层覆盖都会落到这里）。
+  const declaredKeys = new Set();
   for (const [routeName, route] of Object.entries(providers ?? {})) {
     const models = Array.isArray(route?.models) ? route.models : [];
     for (const m of models) {
       const id = m?.id;
       if (!id) continue;
+      declaredKeys.add(`${routeName}\u0000${id}`);
       const fact = facts.get(`${routeName}\u0000${id}`) ?? null;
       const declaredCtx = Number.isFinite(m.contextWindow)
         ? m.contextWindow
@@ -324,6 +328,30 @@ export function reconcile({ facts, providers, compaction }) {
       else row.verdict = "一致（已观测）";
       rows.push(row);
     }
+  }
+  for (const [key, fact] of facts) {
+    if (declaredKeys.has(key)) continue;
+    if (!(fact.requests > 0 || fact.imageMessages > 0)) continue;
+    const [provider, model] = key.split("\u0000");
+    rows.push({
+      route: provider, model,
+      declaredCtx: null, declaredMax: null, declaredImage: null,
+      runtimeCtx: [...fact.contextWindows],
+      latestRuntimeCtx: fact.latestContextWindow ?? null,
+      requests: fact.requests,
+      maxInputTokens: fact.maxInputTokens,
+      imageUsed: fact.imageMessages > 0,
+      imageMessages: fact.imageMessages,
+      reasoningSeen: fact.reasoningMessages > 0,
+      retries: fact.retries,
+      failures: fact.failures,
+      verdict: "配置里已没有这个模型",
+      orphan: true,
+      issues: [],
+      warnings: [
+        `会话里用过 ${fact.requests} 轮（provider=${provider}, model=${model}），但当前补丁里没有任何路由声明它 —— 可能是改过路由名/模型名、删了条目，或被别的层覆盖`,
+      ],
+    });
   }
   return { rows, problems };
 }
