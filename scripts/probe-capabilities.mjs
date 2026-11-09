@@ -242,14 +242,21 @@ async function main() {
     : switchable.some((v) => String(v).startsWith("thinking")) ? "deepseek"
     : switchable.some((v) => String(v).startsWith("reasoning_effort")) ? "openai"
     : null;
-  // 档位：只在「开关两个方向都测出差异」时给多档；否则给单档
-  const levels = canDisable && canEnable ? ["low", "high"] : [];
+  // 档位：只有**证据表明 low/high 真的有差异**时才给多档。
+  // v0.3.1 修：旧版只要「开关两个方向都能动」就给 low+high，但 qwen/chat-template
+  // 这类布尔开关格式里，多档实际等价（wire payload 测试证明：不声明
+  // supportsReasoningEffort 时 low/high 请求体逐字节相同）。判据是：
+  // 真正让思考变化的写法是 reasoning_effort（而不是布尔开关）→ 说明网关认 effort。
+  const effortMechanism = switchable.some((v) => String(v).startsWith("reasoning_effort"));
+  const supportsEffort = effortMechanism;
+  const levels = canDisable && canEnable && effortMechanism ? ["low", "high"] : ["high"];
   const thinking = {
     format: switchFormat,
     defaultOn,
     canDisable,
     canEnable,
     levels,
+    supportsEffort,
     question,
   };
 
@@ -327,7 +334,7 @@ async function main() {
     thinking,
   });
   findings.yaml = snippet.yaml;
-  findings.snippet = { chosenMaxTokens: snippet.chosenMaxTokens, budget: snippet.budget, notes: snippet.notes };
+  findings.snippet = { chosenMaxTokens: snippet.chosenMaxTokens, budget: snippet.budget, notes: snippet.notes, fatal: snippet.fatal };
   findings.summary = {
     listedInModels: listed,
     modelFields,
@@ -337,6 +344,7 @@ async function main() {
     thinkingCanDisable: canDisable,
     thinkingCanEnable: canEnable,
     thinkingSwitchable: switchable,
+    thinkingSupportsEffort: supportsEffort,
     vision: visionOk,
     streamDeltaKeys: [...deltaKeys],
     contextWindow,
@@ -352,9 +360,16 @@ async function main() {
       if (snippet.notes.length) console.log(`\n注意：\n${snippet.notes.map((n) => "  · " + n).join("\n")}`);
     }
   }
-  // 关键步骤失败才算失败：/models 不可用不算（很多网关不实现），但基础 chat 或输出上限全拒要算
+  // 关键步骤失败才算失败：/models 不可用不算（很多网关不实现），但基础 chat 或输出上限全拒要算；
+  // 片段算不出安全配置（窗口太小 / headroom 太大）也算失败——否则用户会拿到一份
+  // 必然被 compaction-basic 拒掉、或根本没写 maxTokens 的片段而不知道。
   const basicOk = findings.steps.some((x) => x.name === "basic-chat" && x.status === 200);
-  return basicOk ? 0 : 1;
+  if (!basicOk) return 1;
+  if (snippet.fatal) {
+    console.error(`\n片段不完整：${snippet.notes[snippet.notes.length - 1] ?? "算不出安全的 maxTokens"}`);
+    return 1;
+  }
+  return 0;
 }
 
 main()

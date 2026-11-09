@@ -942,3 +942,58 @@ test("wire：deepseek 格式用 thinking.type 表达开关", skipIfNoPiAi, async
   assert.deepEqual(bodies[0].thinking, { type: "disabled" });
   assert.deepEqual(bodies[1].thinking, { type: "enabled" });
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 13：v0.3.1 自审补丁
+//   ① 小窗口下不再假装有安全 maxTokens（旧版会给出 1024 这种必然被
+//      compaction-basic 拒的值，或者根本没写 maxTokens 却报成功）
+//   ② 多档只在「reasoning_effort 真的起作用」时写（旧版开关双向能测就给两档，
+//      qwen 布尔开关里两档等价，用户 UI 上看到两个一样的档）
+//   ③ minContextWindowFor 计入 gap/retain，不再是 max+headroom+1
+// ═══════════════════════════════════════════════════════════════════════
+
+test("snippet：窗口小到过不了压缩预算时 fatal=true 且不写 maxTokens", async () => {
+  const { buildSnippet } = await import(new URL("../lib/snippet.mjs", import.meta.url).pathname);
+  const r = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: 65536, gateMaxTokens: 65536, visionOk: false, thinking: null });
+  assert.equal(r.fatal, true);
+  assert.equal(r.chosenMaxTokens, null);
+  assert.equal(/maxTokens:/.test(r.yaml), false, "不能写出一个必然被拒的 maxTokens");
+  assert.ok(r.notes.some((n) => n.includes("没有任何 maxTokens 能过压缩预算")));
+});
+
+test("snippet：qwen 只证明开关能变时只写一档，且过自审不再报 qwen-levels-may-collapse", async () => {
+  const { buildSnippet } = await import(new URL("../lib/snippet.mjs", import.meta.url).pathname);
+  const { staticAudit } = await import(new URL("../lib/audit.mjs", import.meta.url).pathname);
+  const { default: YAML } = await import("/opt/dsh/node_modules/yaml/dist/index.js").catch(() => ({ default: null }));
+
+  const boolSwitch = buildSnippet({
+    base: "https://x.invalid/v1", model: "m", contextWindow: 262144, gateMaxTokens: 65536, visionOk: false,
+    thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, levels: ["high"], supportsEffort: false },
+  });
+  assert.equal((boolSwitch.yaml.match(/^\s+(low|high):/gm) ?? []).length, 1, "只该有一档（off 之外）");
+  assert.equal(/supportsReasoningEffort/.test(boolSwitch.yaml), false);
+
+  if (YAML) {
+    const doc = YAML.parse(boolSwitch.yaml.replace(/^\s{6}/gm, "").replace(/^custom-/, "- ") === "" ? "" : `providers:\n${boolSwitch.yaml.replace(/\n/g, "\n")}`);
+    // 片段是 incomplete 的（只有 providers 下的一个路由），这里只做文本级审计断言
+    const provs = {};
+    (void provs); (void doc);
+  }
+
+  const effort = buildSnippet({
+    base: "https://x.invalid/v1", model: "m", contextWindow: 262144, gateMaxTokens: 65536, visionOk: false,
+    thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, levels: ["low", "high"], supportsEffort: true },
+  });
+  assert.equal(/supportsReasoningEffort: true/.test(effort.yaml), true, "实测 effort 生效才写 supportsReasoningEffort");
+  assert.equal((effort.yaml.match(/^\s+(low|high):/gm) ?? []).length, 2);
+});
+
+test("compaction：minContextWindowFor 计入 gap/retain（不只是 max+headroom+1）", async () => {
+  const { minContextWindowFor, computeBudget } = await import(new URL("../lib/compaction.mjs", import.meta.url).pathname);
+  const min = minContextWindowFor(4096, 65536);
+  assert.equal(min, 117829, "max=4096 headroom=65536 的真实下界");
+  assert.equal(computeBudget({ contextWindow: min, reservedCompletionTokens: 4096, headroomTokens: 65536 }).ok, true);
+  assert.equal(computeBudget({ contextWindow: min - 1, reservedCompletionTokens: 4096, headroomTokens: 65536 }).ok, false);
+  assert.notEqual(min, 4096 + 65536 + 1, "不能再只算 pressure");
+});

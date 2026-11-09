@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.3.0 ｜ **代码提交**：`5eb5b59`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.3.1 ｜ **代码提交**：`5eb5b59`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -164,7 +164,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 
 （以上各行是 【实测】：`node scripts/context-budget.mjs --ctx … --max … --json`。）
 
-**工程后果 2b（v0.3.0 新增）**：安全取值的下限不是「能加载」，而是「`gap >= 30000`」。给定 `headroom`，`B_min = floor(minGap / (1 - retainRatio)) = floor(30000 / 0.84) = 35715`（`retain < threshold - 30000` 的解），所以 `contextWindow > maxTokens + headroom + 35715`。
+**工程后果 2b（v0.3.1 修正）**：安全取值的下限不是「能加载」，而是「`gap >= 30000`」。但下界**不能**用 `B_min = 30000/0.84` 反推——`threshold = min(0.8·ctx, B − headroom)` 里那项 headroom 也要吃掉 gap。正确做法是数值求解（`lib/compaction.mjs` 的 `minContextWindowFor`）：实测 `maxTokens=4096` 时窗口要 **≥ 117829**、`16384` → **130117**、`65536` → **179269**（headroom=65536、minGap=30000）。v0.3.0 曾写成 `maxTokens + headroom + 35715`，漏了 headroom 进 gap，本版已改正。
 
 **工程后果 3**：`headroomTokens` 是公开配置键（`:63` 读取，`:103` 支持 per-target 覆盖），不是硬编码常量。把 65536 调到 16384，可以让 64k 窗口的模型也能加载（反推公式：`contextWindow > maxTokens + headroomTokens`）。
 

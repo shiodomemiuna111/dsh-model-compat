@@ -24,6 +24,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { locateProviders, removeRouteBlock, renderRouteYaml } from "../lib/yaml-edit.mjs";
+import { pickSafeMaxTokens } from "../lib/compaction.mjs";
 import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
 import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom } from "../lib/fs-safe.mjs";
 
@@ -97,7 +98,18 @@ o.assumeCtx ??= undefined;
 const ctx = need("contextWindow", s.contextWindow, o.assumeCtx);
 const probeMax = s.outputCap;
 if (probeMax === null || probeMax === undefined) console.error("警告：输出上限未探测到，退回 --max（默认 65536，保守值）");
-const maxTokens = Math.min(Number(probeMax) || o.maxOverride || 65536, 65536);
+// v0.3.1：maxTokens 不再写死 min(probeMax,65536)，改为按 ctx×0.2 与压缩预算反推，
+// 否则 ctx=131072 + max=65536 会 pressure=0，写进去必然被 compaction-basic 拒。
+const pick = pickSafeMaxTokens({
+  contextWindow: ctx,
+  gateMax: Number(probeMax) || Number(o.maxOverride) || null,
+  headroomTokens: o.headroom,
+});
+const maxTokens = pick.maxTokens ?? Number(o.maxOverride) ?? 0;
+if (pick.maxTokens === null) {
+  console.error(`这个窗口（ctx=${ctx}）下没有安全的 maxTokens：${pick.reason}；请调小 --headroom 或换更大窗口的模型。`);
+  process.exit(1);
+}
 const input = ["text", ...(s.vision ? ["image"] : [])];
 const switchable = Array.isArray(s.thinkingSwitchable) && s.thinkingSwitchable.length > 0;
 
@@ -146,7 +158,16 @@ const profile = {
     maxTokens,
     input,
     ...(compat ? { compat } : {}),
-    reasoningEfforts: { off: null, low: "low", high: "high" },
+    // v0.3.1：档位只在实测证明「开关能变」时才写；off 档只在实测关得掉时写；
+    // 多档只在 reasoning_effort 真的生效时写（否则 UI 上是两个等价档）。
+    ...(switchable
+      ? {
+          reasoningEfforts: {
+            ...(s.thinkingCanDisable === false ? {} : { off: null }),
+            ...(effortProven ? { low: "low", high: "high" } : { high: "high" }),
+          },
+        }
+      : { reasoningEfforts: false }),
   }],
 };
 
