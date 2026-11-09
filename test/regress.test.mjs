@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, copyFileSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -1128,4 +1128,139 @@ test("审计 P1-10：两个进程并发写同一 patch，必须有一个明确�
   assert.equal(okCount, 1, "应当只有一个写入成功");
   assert.equal(failed.length, 1);
   assert.match(failed[0].stderr + failed[0].stdout, /被另一个进程改过|并发写/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 16：verify-effective —— 「声明 vs 运行时实际」对账（v0.3.6 新增）
+// 造假底线：会话文件是我们自己用 zstd 压出来的**真实格式**（DSH 写的那些事件类型），
+// 不是给脚本开的后门；脚本照样要解压、照样按事件归属模型。
+// ═══════════════════════════════════════════════════════════════════════
+test("verify-effective：抓到「运行时 contextWindow 与声明不符」和上下文超限错误", async () => {
+  const { zstdCompressSync } = await import("node:zlib");
+  const d = tmp();
+  const sessions = join(d, "sessions");
+  const sdir = join(sessions, "--root-workspace--", "session-abc");
+  // 目录要一级级建
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(sdir, { recursive: true });
+
+  const events = [
+    { type: "request/context", data: { provider: "custom-x", model: "m", contextWindow: 131072 } },
+    { type: "request/header", data: { header: { config: { provider: "custom-x", model: "m" } } } },
+    { type: "assistant/message", data: { usage: { inputTokens: 900000 }, message: { content: [{ type: "text", text: "hi" }] } } },
+    { type: "user/message", data: { message: { content: [{ type: "image", source: "x" }, { type: "text", text: "看图" }] } } },
+    {
+      type: "assistant/attempt",
+      data: { stream: [{ chunk: { reason: { kind: "error", failure: { message: "400 context_length_exceeded: maximum context length is 131072 tokens" } } } }] },
+    },
+  ];
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
+
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      custom-x:\n        api: openai-completions\n        baseURL: https://x.invalid/v1\n        models:\n          - id: m\n            contextWindow: 1000000\n            maxTokens: 128000\n            input: [text]\n`);
+
+  // 有矛盾时脚本按设计 exit 1（便于 CI 卡住）；这里用 spawnSync 读 stdout 再断言。
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 1, `期望 exit 1，实际 ${r.status}：${r.stderr?.slice(0, 400)}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.problems.length, 1, r.stdout.slice(0, 600));
+  const p = out.problems[0];
+  const all = p.issues.join(" | ");
+  assert.match(all, /运行时 contextWindow=131072/, all);
+  assert.match(all, /context-overflow/, all);
+  assert.match(all, /image/, all);
+});
+
+test("verify-effective：会话里没有该模型时不报错（只标「未使用」）", async () => {
+  const d = tmp();
+  const sessions = join(d, "sessions");
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      custom-y:\n        api: openai-completions\n        baseURL: https://y.invalid/v1\n        models:\n          - id: never\n            contextWindow: 200000\n            maxTokens: 8192\n`);
+  const r = execFileSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json", "--no-log"], { encoding: "utf8" });
+  const out = JSON.parse(r);
+  assert.equal(out.problems.length, 0);
+  assert.match(out.rows[0].verdict, /未使用/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 17：repair --apply —— 探针 → 改字段 → 三方校验 → 备份 → 写后复验 → 日志
+// ═══════════════════════════════════════════════════════════════════════
+const PROBE_FIXTURE = {
+  base: "http://127.0.0.1:19431/v1",
+  model: "probe-m",
+  summary: {
+    contextWindow: 131072, gateMaxTokens: 65536, vision: true,
+    switchFormat: "qwen", thinkingDefaultOn: true, thinkingCanDisable: true,
+    thinkingCanEnable: true, thinkingSupportsEffort: false,
+  },
+};
+
+test("repair：默认 dry-run 只给 diff、不写盘；--apply 才写，且写后复验通过、留备份与日志", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  const log = join(d, "repair.log.jsonl");
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify(PROBE_FIXTURE));
+  const original = `- id: llm-pi-ai\n  config:\n    providers:\n      ended:\n        api: openai-completions\n        baseURL: http://127.0.0.1:19431/v1\n        models:\n          - id: probe-m\n            contextWindow: 1000000\n            maxTokens: 128000\n            input: [text]\n            reasoningEfforts: {off: null, low: low, high: high}\n`;
+  writeFileSync(patch, original);
+
+  const dry = execFileSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--log", log], { encoding: "utf8" });
+  // ctx=131072 + headroom 65536 → min(gate 65536, ctx×0.2=26214) 里只有 16384 还能让 gap≥30000（32768 时 gap=17040）
+  assert.match(dry, /maxTokens: 128000 → 16384/);
+  assert.equal(readFileSync(patch, "utf8"), original, "dry-run 不应写盘");
+
+  const applied = execFileSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--log", log], { encoding: "utf8" });
+  assert.match(applied, /已修正 1 个模型/);
+  const after = readFileSync(patch, "utf8");
+  assert.match(after, /contextWindow: 131072/);
+  assert.match(after, /maxTokens: 16384/);
+  assert.doesNotMatch(after, /supportsReasoningEffort/, "探针说 thinkingSupportsEffort=false：不该写 supportsReasoningEffort");
+  assert.doesNotMatch(after, /low: low/);
+  const baks = readdirSync(d).filter((f) => f.includes(".bak-"));
+  assert.ok(baks.length >= 1, `应留下备份，实际：${readdirSync(d).join(",")}`);
+  const recs = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(recs.some((r) => r.t === "change" && /maxTokens/.test(r.field)), JSON.stringify(recs.slice(-3)));
+  assert.ok(recs.some((r) => r.t === "attempt" && r.status === "ok" && r.phases.some((p) => p.name === "写后校验")), JSON.stringify(recs.slice(-2)));
+
+  // 再跑一次：应该「不需要修正」
+  const again = execFileSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--log", log], { encoding: "utf8" });
+  assert.match(again, /不需要修正/);
+});
+
+test("repair：窗口太小算不出 maxTokens 时拒绝写盘（不猜），exit 1", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify({ ...PROBE_FIXTURE, summary: { ...PROBE_FIXTURE.summary, contextWindow: 8192 } }));
+  const original = `- id: llm-pi-ai\n  config:\n    providers:\n      small:\n        api: openai-completions\n        baseURL: http://127.0.0.1:19431/v1\n        models:\n          - id: probe-m\n            contextWindow: 8192\n            maxTokens: 4096\n`;
+  writeFileSync(patch, original);
+  let code = 0;
+  try {
+    execFileSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--no-log"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) { code = e.status; assert.match(String(e.stderr), /没有任何 maxTokens 能过压缩预算/); }
+  assert.equal(code, 1);
+  assert.equal(readFileSync(patch, "utf8"), original, "不可修正时必须一字不改");
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 18：runlog —— 「为什么上一次没成功」必须能从日志里读出来
+// ═══════════════════════════════════════════════════════════════════════
+test("runlog：同一尝试键的失败会被下一次记录成 prevFailure（人读一句话）", async () => {
+  const { logAttempt, lastFailureFor, attemptKey, describeFailure } = await import("../lib/runlog.mjs");
+  const d = tmp();
+  const log = join(d, "x.log.jsonl");
+  const key = attemptKey({ cmd: "repair", patch: join(d, "p.yml") });
+  const fail = logAttempt(log, {
+    cmd: "repair", patch: join(d, "p.yml"), status: "fail",
+    phases: [{ name: "写后校验", ok: false, detail: "压缩预算：压力预算为负" }],
+  });
+  assert.equal(fail.status, "fail");
+  const next = logAttempt(log, {
+    cmd: "repair", patch: join(d, "p.yml"), status: "ok",
+    phases: [{ name: "写后校验", ok: true }],
+  });
+  assert.equal(next.prevFailureId, fail.ts);
+  assert.match(next.prevFailure, /上次失败在写后校验/);
+  assert.equal(lastFailureFor(log, key).status, "fail");
+  assert.match(describeFailure(lastFailureFor(log, key)), /压力预算为负/);
 });

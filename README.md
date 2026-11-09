@@ -6,11 +6,14 @@
 > 窗口、模态、思考档位全都落到默认值（1M 上下文 / 128k 输出 / 只收文本），于是会出现
 > 「上下文突然爆」「说看不见图」「思考深度调不了」。**这不是 bug，是没声明。**
 
-本仓库提供 6 个零依赖的 Node 脚本 + 7 个共享库，做三件事：
+本仓库提供 8 个零依赖的 Node 脚本 + 8 个共享库，做四件事：
 
 1. **测**——用真实（便宜的）请求测出这个端点到底有什么能力；
 2. **验**——不启动 DSH，直接让 `dsh-llm-pi-ai` 的校验路径解析你写的 YAML，并顺带算压缩联动数字；
-3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效。
+3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效；
+4. **上线后对账 + 自动修正**——从真实会话记录里查「声明 vs 实际」，按探针结果重算并安全改写，全程留 JSONL 日志（含「上次为什么失败」）。
+
+> **v0.3.7**（用户三问：有没有按键 / 怎么知道生效 / 没生效怎么自动修正并记日志）：新增两个脚本 `verify-effective.mjs`（读 `$DSH_HOME/sessions/**/session.v4.jsonl.zstd`，比对运行时 `contextWindow`、实际 inputTokens、真实发图、失败类别）与 `repair.mjs`（默认 dry-run 出 diff，`--apply` 才写：三段校验 → 备份 → 原子写 → 写后复验 → 失败回滚）；新增 `lib/runlog.mjs`（JSONL，下一次尝试自动带出上一次失败原因）；`lib/snippet.mjs` 抽出 `thinkingDecl`，probe / snippet / repair 共用一套「思考怎么声明」规则。测试 77 → **82 条**（组 16/17/18）。
 
 > **v0.3.1**（自审）：`inject-model` 的 `reasoningEfforts` 不再写死；`snippet` 在小窗口下直接判 `fatal` 而不是给出必然被拒的 `maxTokens`；`minContextWindowFor` 计入 `gap>=30000`（4096 → 117829）；qwen 布尔开关只写一档并补 `supportsReasoningEffort`。测试 71 条（组 14 补了 probe 端到端）。
 >
@@ -48,7 +51,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 
 ---
 
-## 六个脚本
+## 八个脚本
 
 | 脚本 | 花不花钱 | 干什么 |
 |---|---|---|
@@ -58,6 +61,8 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 | `inject-model.mjs` | 不花钱 | 把探测结果安全写进 `cordis.patch.yml`：写入前隔离预演、写入后复验、失败自动回滚 |
 | `probe-matrix.mjs` | 不花钱（只装 npm 包） | 在 `/tmp` 里给每个历史版本搭隔离沙箱，跑同一份 YAML |
 | `merge-routes.mjs` | 不花钱 | 批量导入路由：逐条隔离验证 → 只写通过的 → 写后复验 → 失败回滚 |
+| `verify-effective.mjs` | 不花钱 | **运行时对账**：读 DSH 会话记录，查出「声明 ctx ≠ 运行时 ctx」「输入越过压缩阈值」「发了图却没声明 image」「context-overflow 类失败」。有矛盾 exit 1 |
+| `repair.mjs` | 不花钱 | **自动修正**：探针结果 → 重算 `contextWindow`/`maxTokens`/`input`/思考声明 → 三段校验 → 备份 → 原子写 → 写后复验 → 失败回滚。默认 dry-run |
 
 都没用第三方依赖；YAML 解析借用 DSH 自带的 `yaml` 包。
 
@@ -110,11 +115,14 @@ scripts/context-budget.mjs       纯计算压缩阈值
 scripts/inject-model.mjs         安全写入（预演→写入→复验→回滚）
 scripts/merge-routes.mjs         批量导入（单条失败不拖累全局）
 scripts/probe-matrix.mjs         跨版本沙箱复验
+scripts/verify-effective.mjs     运行时对账（声明 vs 实际会话）
+scripts/repair.mjs               按探针结果自动修正（dry-run / --apply）
 examples/cordis.patch.yml        可直接抄的两种写法
 docs/method.md                   方法论：为什么不要抄厂商数字
 docs/portability.md              跨版本验证记录与结论
 docs/pitfalls.md                 实操踩坑（含本机实测数据）
 docs/failure-modes.md            失败模式：一条坏声明会不会毒死全局、卡死怎么兜底
+lib/runlog.mjs                   运行日志（JSONL，带「上次失败原因」）
 docs/spec.md                     规格书（给外部评审：机制事实 + 方案 + 证据 + 已知边界）
 ```
 

@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.3.5 ｜ **代码提交**：`c626330`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.3.7 ｜ **代码提交**：`c626330`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -31,7 +31,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 6 个零依赖脚本 + 7 个共享库 + 一份可直接抄的声明模板 + 77 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 8 个零依赖脚本 + 8 个共享库 + 一份可直接抄的声明模板 + 82 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -277,7 +277,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
                        └─────────────────────────────┘
 ```
 
-### 3.3 六个脚本（逐个规格）
+### 3.3 八个脚本（逐个规格）
 
 共同约定：**零第三方依赖**；不启动 DSH；除 `probe-*` 外不联网；写下文件的脚本都会先备份。
 
@@ -289,6 +289,8 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | `inject-model.mjs` | 把一条探测结果安全写进 patch 文件 | `--patch` `--route` `--probe`（必填）、`--plugin-root`、`--dry-run`、`--force`、`--assume-ctx`/`--assume-contextWindow`、`--max`、`--api`、`--api-key-env` | 0 写入成功或 dry-run 通过；1 校验失败/拒绝写入；2 用法错误 | 不花钱 |
 | `merge-routes.mjs` | 批量导入路由，单条失败不拖累全局 | `--patch` `--from`（可重复，必填）、`--plugin`/`--plugin-root`、`--dry-run`、`--replace`、`--no-verify` | 0 有写入或已是最新；1 没有可写入条目/复验失败（已回滚）；2 用法错误 | 不花钱 |
 | `probe-matrix.mjs` | 跨版本沙箱复验同一份 YAML | `--patch`、`--versions a,b`、`--work DIR`、`--dsh-root`、`--keep` | 0 全通过且一致；非 0 有版本失败 | 不花钱（只装 npm 包） |
+| `verify-effective.mjs` | **运行时对账**：读 DSH 会话记录，比对「声明 vs 实际」（v0.3.6） | `--patch`、`--sessions`、`--last N`、`--json`、`--log`/`--no-log`、`--verbose` | 0 无矛盾；1 有矛盾（矛盾≠警告） | 不花钱 |
+| `repair.mjs` | **自动修正**：探针结果 → 重算字段 → 三方校验 → 备份 → 原子写 → 写后复验 → 失败回滚（v0.3.6） | `--patch` `--probe`（必填）、`--route`、`--apply`/`--dry-run`（默认 dry-run）、`--log`/`--no-log`、`--plugin-root`、`--json` | 0 无需修正或已修正；1 不可修正/写后校验失败已回滚；2 用法错误 | 不花钱 |
 
 **`probe-capabilities.mjs` 的七个探测项与判据（v0.3.0 全部重写）**：
 
@@ -304,7 +306,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 
 > v0.3.0 修的三处判据漏洞：旧版「输出上限」只发一次 `max_tokens=400000`（多数网关直接 400，测出来的是「不支持 400k」而不是上限）；旧版视觉判据 `200 && (有回答 || prompt_tokens>20)` 里「有回答」恒真（静默丢图的网关全放行）；旧版思考只测「怎么关」（默认关闭的模型会被误判成不可调）。
 
-### 3.4 七个共享库
+### 3.4 八个共享库
 
 | 库 | 导出 | 职责 |
 |---|---|---|
@@ -314,7 +316,8 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | `lib/load-path.mjs` | `verifyLoadPath(pluginRoot, providers, mode, options) → {schema, semantic, budget, routes}` | 把插件入口复制成**临时目录里的探针**（不写进 node_modules），补 `export { resolveProfiles }`，跑**三段**：Config → resolveProfiles → 压缩预算 |
 | `lib/fs-safe.mjs` | `resolveWriteTarget` `atomicWriteFile` `backupFile` `rollbackFrom` | realpath 跟随软链、同目录临时文件 + 校验 + `rename` 原子替换、带时间戳备份与回滚 |
 | `lib/yaml-edit.mjs` | `locateProviders` `removeRouteBlock` `renderRouteYaml` `renderManagedBlock` `findManagedBlock` | 保留注释与格式地增删 providers 条目；缩进从目标文件探测 |
-| `lib/snippet.mjs` | `buildSnippet(...) → {yaml, chosenMaxTokens, budget, notes}` | 证据 → YAML 片段的唯一出口；`maxTokens` 由 `pickSafeMaxTokens` 反推，不再硬编码 65536 |
+| `lib/snippet.mjs` | `buildSnippet(...) → {yaml, chosenMaxTokens, budget, notes}`、`thinkingDecl(t) → {compat, efforts, notes}` | 证据 → YAML 片段的唯一出口；`maxTokens` 由 `pickSafeMaxTokens` 反推，不再硬编码 65536；v0.3.6 把「思考怎么声明」抽成 `thinkingDecl`，probe / snippet / repair 三处共用，避免规则漂移 |
+| `lib/runlog.mjs` | `attemptKey` `logAttempt` `logChange` `readRecords` `lastFailureFor` `describeFailure` | JSONL 运行日志：同一尝试键的**上一次失败**会被下一次记录自动带出（`prevFailureId`/`prevFailure`），回答「为什么上次没成功」 |
 
 ### 3.5 声明决策表（写什么、为什么）
 
@@ -371,6 +374,24 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 9. **软链（v0.3.0）**：写之前 `realpathSync` 解析；如果目标是指向别处的软链，写真实文件并保留软链，不会把软链替换成普通文件。
 10. **第 3 段预算校验（v0.3.0）**：`inject-model` / `merge-routes` / `resolve-check` 写前都会跑 `computeBudget`，不过就拒绝（`inject-model` 可用 `--force` 绕过，`merge-routes` 无绕过）。
 
+### 3.7.1 运行时对账与自愈（v0.3.6 新增）
+
+前面 1–10 条只保证「**写之前**是对的」。但声明有可能在**运行中**被发现不对（网关偷偷换窗口、别的层覆盖了参数、模型换了实现）。v0.3.6 补上闭环的另外两环：
+
+| 环 | 工具 | 输入 → 输出 | 判据（怎么算「没生效」） |
+|---|---|---|---|
+| 发现 | `verify-effective.mjs` | DSH 会话记录（`$DSH_HOME/sessions/**/session.v4.jsonl.zstd`）+ 当前 patch → 每路由每模型的 `verdict` / `issues` | ①`request/context` 里的运行时 `contextWindow` ≠ 声明值；②实际 `inputTokens` ≥ 压缩阈值；③会话真的发过 `type:"image"` 但声明 `input` 不含 image；④失败按类归并后命中 `context-overflow` / `image-unsupported` / `thinking-rejected`（这些算**矛盾**，auth/rate 只算警告） |
+| 修正 | `repair.mjs` | 探测结果 JSON + 当前 patch → 逐字段 diff，`--apply` 才写 | 用 `thinkingDecl` 与 `pickSafeMaxTokens` 重算；写前跑三段校验，写后**再跑一次**；失败 `rollbackFrom` |
+| 留痕 | `lib/runlog.mjs` | 每次尝试 → 一行 JSONL | 同 `attemptKey({cmd,patch,route})` 的上一次 `status:"fail"` 会被本次记录带成 `prevFailure`（人读：「上次失败在<阶段>：<报错原文>」） |
+
+关键取舍（**请重点评审**）：
+
+- `repair` **默认 dry-run**，只打 diff；只有 `--apply` 才写。理由：自动改配置的风险高于手工，必须显式二次确认。
+- `repair` 无法确定的值**不猜**：探针没测到窗口 → 沿用现有值 + 打印提示；任何 maxTokens 都过不了预算 → 拒绝写盘 exit 1。
+- `repair` 重写的是**整块路由 YAML**（`renderRouteYaml`），所以该路由里的注释会丢、格式会重排；它不碰别的路由，也不碰托管块外的内容。
+- `verify-effective` 只读会话文件，**不改任何东西**；有矛盾 exit 1（便于放进 CI/定时任务）。
+- 会话归属靠「按顺序取最近的 `request/context`/`request/header`」：`assistant/message` 事件本身不带 provider/model（实测），这是 DSH 的事件格式约束，不是猜测。
+
 ### 3.8 跨版本矩阵
 
 `probe-matrix.mjs` 在 `/tmp` 给每个目标版本搭隔离沙箱：安装该版本 `dsh-llm-pi-ai` + 匹配的 `pi-ai`，其余 `@deepseek-ai/*` 从本机 DSH 安装目录 `symlink`，再跑 `resolveProfiles`。
@@ -387,13 +408,13 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 
 | # | 命令 | 结果 | 时间 |
 |---|---|---|---|
-| 1 | `npm test` | **77 pass / 0 fail / 0 skip**（15 个测试组） | 2026-11-09 |
+| 1 | `npm test` | **82 pass / 0 fail / 0 skip**（18 个测试组） | 2026-11-09 |
 | 2 | `npm run selfcheck` | exit 0（测试 + 示例预算 + 示例两段校验） | 2026-11-09 |
 | 3 | `node scripts/resolve-check.mjs --patch /root/.dsh/profiles/web/cordis.patch.yml --lint --budget` | exit 0；5 条真实路由全 ✓，静态审计无问题，预算全绿（gap 444163 / 650486 / 554264 / 554264 / 522486） | 2026-11-09 |
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 77 条测试的分组（15 组）
+### 4.2 82 条测试的分组（18 组）
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -412,6 +433,9 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 13 | 3 | v0.3.1 自审：`snippet` 致命（窗口太小）不写死 `maxTokens`、qwen 单档 / effort 双档 + `supportsReasoningEffort`、`minContextWindowFor` 数值下界（4096→117829） |
 | 14 | 2 | **probe 端到端**：mock 网关模拟「布尔开关端点」与「effort 端点」，跑完整 probe→结论→片段 链路 |
 | 15 | 6 | **第二轮对抗审计的 P0/P1 回归**：NaN 死循环、坏 YAML 打栈、重复 compaction 条目取最后一条、`--max` 被回退越过、CRLF 往返、并发写中止 |
+| 16 | 2 | **verify-effective**：用 `zstd` 造真实格式的会话文件，断言抓到「运行时 ctx=131072 但声明 1e6」「inputTokens 越过压缩阈值」「发过图但没声明 image」「context_length_exceeded 归并」；没有该模型时只标「未使用」不报错 |
+| 17 | 2 | **repair**：dry-run 不写盘且给出逐字段 diff；`--apply` 后文件真被改、留备份、写后复验通过、日志里既有 `change` 也有带「写后校验」阶段的 `attempt`；再跑一次「不需要修正」；窗口太小无法算出合法 maxTokens 时拒绝写盘 exit 1 |
+| 18 | 1 | **runlog**：同一尝试键先失败后成功，第二次记录自动带 `prevFailureId` + 人读的 `prevFailure` |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
 
@@ -447,6 +471,15 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 ```
 
 **关于「4 条 ctx=1000000 为什么能过 lint」**（评审 Q&A 里问的）：它们过的是**结构性检查**——三段校验只证明「按你声明的数字算，配置能被加载、压缩不会自相矛盾」，不证明 `1000000` 是这家端点的真实窗口。这四条里的 `1000000` 是**显式写死的**（不是落默认值，所以审计不会报 `default-context-window`），但它们**没有跑过 `--window` 实测**，属于【未验】。真要坐实，得对每个端点跑一次 `probe-capabilities --window`。这也是本方案「声明必须由证据支撑」的自我打脸之处：**本机这份 profile 里就有 4 条未经证据的声明**。
+
+**运行时对账（v0.3.6，**【实测】**）**：`node scripts/verify-effective.mjs --patch ~/.dsh/profiles/web/cordis.patch.yml` 在本机真实会话里抓到一条**矛盾**——
+
+```
+✗ custom-dashscope-aliyuncs / deepseek-v4.1-flash-1017  声明 ctx=1000000  实际 ctx=131072
+  · 运行时 contextWindow=131072，声明是 1000000 —— 「声明没生效」或被别的层覆盖
+```
+
+这正是 §5.3 说的「数字造假时预算检查会一路 ✓」的现实版：它能在**上线后**把矛盾抓出来，而不是等一次 400。同一份报告也给出了「哪些模型真的被用过 / 发过多少图 / 有没有 reasoning 信号」。
 
 ### 4.5 跨版本（**【实测】** 2026-11-09）
 
@@ -494,7 +527,10 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 8. **平台**：只在 Linux（Android proot / aarch64）验证；macOS / Windows 的路径分隔符与权限差异未测（脚本用的是 `node:path`，理论上没问题，但**未验**）。
 9. **`--window` 会真的花钱**：默认关闭，文档里也标了成本；本仓库所有实测都没跑过它（**未验**真实端点上的表现）。
 10. **同一厂商的「思考」语义可能不同**：`enable_thinking` / `thinking.type` / `reasoning_effort` 三种写法在不同网关下含义不同（例如有的 `reasoning_effort` 只影响「思考预算」不影响开关）。探测只能证明「这个写法在这家端点上改变了行为」，不能证明「厂商文档说的是同一件事」。
-11. **`dsh --profile web --dump-config` 不做校验**：它是打印配置，不是校验入口（**【实测】** 塞 `compat.thinkingFormat: bogus` + `contextWindow: "not-a-number"` 仍 exit 0）。所以别拿它当验证手段——用 `resolve-check`。
+11. **运行时对账只能看「已经发生过的会话」**（v0.3.6）：`verify-effective` 依赖 DSH 的会话格式（`session.v4.jsonl.zstd` 里的 `request/context`、`assistant/message` 等事件）。格式变了就要跟着改；而且它只能证明「声明与实际不符」，不能证明「实际就是这家端点的物理上限」（网关可能同时限制了窗口和 max_tokens）。
+12. **`repair --apply` 会重排版式并丢掉该路由内的注释**（v0.3.6）：它用 `renderRouteYaml` 整块重渲染。字段值是对的、YAML 是对的，但手写注释不会保留。想保留注释就只用 `--dry-run` 看 diff，然后手改。
+13. **自动修正只覆盖「能由探针决定」的字段**：`contextWindow`（探针没测到就沿用原值并提示）、`maxTokens`（预算反推）、`input`、`reasoningEfforts` / `compat`。`cost`、`headers`、`retryPolicy`、`modelOverrides` 不自动改。
+14. **`dsh --profile web --dump-config` 不做校验**：它是打印配置，不是校验入口（**【实测】** 塞 `compat.thinkingFormat: bogus` + `contextWindow: "not-a-number"` 仍 exit 0）。所以别拿它当验证手段——用 `resolve-check`。
 
 ---
 
