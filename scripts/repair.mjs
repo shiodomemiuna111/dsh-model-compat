@@ -32,6 +32,7 @@ import { resolveWriteTarget, backupFile, atomicWriteFile, rollbackFrom, contentF
 import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normalizeEol, applyEol, findRouteBlock } from "../lib/yaml-edit.mjs";
 import { logAttempt, logChange, attemptKey, DEFAULT_LOG } from "../lib/runlog.mjs";
 import { usageText } from "../lib/usage.mjs";
+import { defaultPatchPath } from "../lib/defaults.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -107,7 +108,8 @@ async function main() {
   let o;
   try { o = parseArgs(process.argv.slice(2)); } catch (e) { console.error(`用法错误：${String(e.message)}`); process.exit(2); }
   if (o.help) { console.log(usageText("repair.mjs")); return; }
-  if (!o.patch) { console.error("缺少 --patch（或设置 DSH_HOME_PROFILE_PATCH）"); process.exit(2); }
+  if (!o.patch) o.patch = defaultPatchPath(); // v0.4.3：默认修本机 profile
+
   if (!o.probe) { console.error("缺少 --probe：请先用 probe-capabilities.mjs --json 生成探测结果"); process.exit(2); }
   if (!existsSync(o.patch)) { console.error(`读不到补丁：${o.patch}`); process.exit(2); }
   const pluginRoot = locatePluginRoot(o.pluginRoot);

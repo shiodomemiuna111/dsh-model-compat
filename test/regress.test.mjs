@@ -1880,3 +1880,32 @@ test("组 24：认不出的失败（中文超限）不再静默丢弃（P2-2）"
   const all = JSON.stringify(out);
   assert.match(all, /输入过长/, `中文超限原文必须出现在输出里（不能 false green）：${all.slice(0, 800)}`);
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 25：装上 DSH（v0.4.3）—— npm link 软链下脚本必须真的跑起来
+// ═══════════════════════════════════════════════════════════════════════
+test("组 25：通过软链调用脚本时入口判定必须成立（否则静默 exit 0 = 假绿）", async () => {
+  const { symlinkSync } = await import("node:fs");
+  const d = tmp();
+  const link = join(d, "dmc-verify");
+  symlinkSync(join(ROOT, "scripts", "verify-effective.mjs"), link);
+  const r = spawnSync(process.execPath, [link, "--patch", join(d, "nope.yml"), "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 2, `软链调用应当真的执行并报用法/读取错误，而不是静默 0：${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /读不到补丁|补丁解析失败/, r.stderr.slice(0, 300));
+});
+
+test("组 25：默认补丁路径的优先级（env > 本机 profile > 示例）", async () => {
+  const { defaultPatchPath, localPatchPath } = await import("../lib/defaults.mjs");
+  const old = { ...process.env };
+  try {
+    process.env.DSH_HOME_PROFILE_PATCH = "/tmp/explicit.yml";
+    assert.equal(defaultPatchPath(), "/tmp/explicit.yml");
+    delete process.env.DSH_HOME_PROFILE_PATCH;
+    process.env.DSH_HOME = "/tmp/definitely-no-dsh-home";
+    assert.equal(localPatchPath(), null, "DSH_HOME 下没有 profile 时不应返回路径");
+    assert.match(defaultPatchPath(), /examples[\\/]cordis\.patch\.yml$/, "最后回落到仓库示例");
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in old)) delete process.env[k];
+    Object.assign(process.env, old);
+  }
+});

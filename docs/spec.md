@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.4.3 ｜ **代码提交**：`d7b22f1`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.4.3 ｜ **代码提交**：`HASHZ`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -53,7 +53,7 @@
 | ⑤`repair --apply` 重渲染会抹掉 headers / retryPolicy / timeoutMs / thinkingBudgets | **不成立**（`renderRouteYaml` 是对整个路由对象做 YAML.stringify，未知字段天然保留） | 实测复现：`headers/retryPolicy/timeoutMs/thinkingBudgets/transport/displayName` 全部原样保留；已补组 22 回归测试锁死这个行为 |
 | ⑥窗口探测把 413/429/超时当成窗口边界 | **成立** | 抽出 `lib/probe-heuristics.mjs::classifyWindowStop`：只有 `context-overflow` 才算撞墙；`gateway-limit` 只报「网关限制，无法判定窗口」，并给出「至少这么大」的下界说明 |
 
-文档侧同时改掉 4 处自相矛盾：§2.4 的 `headroomTokens` 硬失败表述、§2.7/§3.5 残留的「必须能把 reasoning 归零」旧文案、§3.5 建议 `defaultMaxTokens: 65536`、附录 B 的 probe/repair 退出码。测试 95 → 101 条（22 组）→ 102 条（23 组）→ **107 条（24 组，v0.4.2）**。
+文档侧同时改掉 4 处自相矛盾：§2.4 的 `headroomTokens` 硬失败表述、§2.7/§3.5 残留的「必须能把 reasoning 归零」旧文案、§3.5 建议 `defaultMaxTokens: 65536`、附录 B 的 probe/repair 退出码。测试 95 → 101 条（22 组）→ 102 条（23 组）→ **107 条（24 组，v0.4.2）→ **109 条（25 组，v0.4.3）****。
 
 ---
 
@@ -108,7 +108,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 8 个零依赖脚本 + 10 个共享库 + 一份可直接抄的声明模板 + 107 条回归测试（含 4 条真实 wire 断言，不再有「跳过也变绿」的空跑用例）。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 8 个零依赖脚本 + 10 个共享库 + 一份可直接抄的声明模板 + 109 条回归测试（含 4 条真实 wire 断言，不再有「跳过也变绿」的空跑用例）。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -510,13 +510,13 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 
 | # | 命令 | 结果 | 时间 |
 |---|---|---|---|
-| 1 | `npm test` | **107 pass / 0 fail / 0 skip**（24 个测试组） | 2026-11-09 |
+| 1 | `npm test` | **109 pass / 0 fail / 0 skip**（25 个测试组） | 2026-11-09 |
 | 2 | `npm run selfcheck` | exit 0（测试 + 示例预算 + 示例两段校验） | 2026-11-09 |
 | 3 | `node scripts/resolve-check.mjs --patch /root/.dsh/profiles/web/cordis.patch.yml --lint --budget` | exit 0；5 条真实路由全 ✓，**静态审计 1 条警告**（`qwen-effort-may-be-ignored`：dashscope 路由声明了 `supportsReasoningEffort: true`，百炼可能静默忽略 → 属提示不是错误），预算全绿（gap 444163 / 650486 / 554264 / 554264 / 522486） | 2026-11-09 |
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 107 条测试的分组（24 组）
+### 4.2 109 条测试的分组（25 组）
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -660,7 +660,7 @@ v0.3.7 曾用同一段数据判出「声明 1e6、运行时 131072 → 矛盾 ex
 
 ```bash
 git clone https://github.com/shiodomemiuna111/dsh-model-compat && cd dsh-model-compat
-npm test                                   # 107 条回归（24 组）
+npm test                                   # 109 条回归（25 组）
 npm run selfcheck                          # 测试 + 示例配置两段校验 + 预算
 node scripts/context-budget.mjs --ctx 131072 --max 128000   # 看「为什么会失败」
 ```
@@ -712,7 +712,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 4. **§3.5 的保守取值（`maxTokens` 32768~65536、`contextWindow` 填实测值）** 在大窗口（≥1M）模型上是否会带来不可接受的提前压缩？有没有更优的 headroom/thresholdRatio 组合？
 5. **§3.6 的「没证据就不写 compat」是否过于保守？** 有没有「不写 compat 就一定错」的协议（例如某些网关必须显式 `enable_thinking` 才开思考）？
 6. **§3.7 的写盘纪律** 还有哪些破坏场景没覆盖？（我已知：SIGKILL 残留、`--replace` 注释残留、并发两个进程同时写同一文件未加锁。）
-7. **§4 的证据强度**：107 条测试（其中 4 条真跑 pi-ai 序列化）+ 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
+7. **§4 的证据强度**：109 条测试（其中 4 条真跑 pi-ai 序列化）+ 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
 8. **§5 的边界**里，哪一条在你看来是「必须修才能交付」，哪一条可以接受为已知限制？
 
 ---

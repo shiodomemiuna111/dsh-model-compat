@@ -28,6 +28,8 @@ import { createRequire } from "node:module";
 import { computeBudget, compactionConfigFromPatch } from "../lib/compaction.mjs";
 import { logAttempt, appendRecord, DEFAULT_LOG } from "../lib/runlog.mjs";
 import { usageText } from "../lib/usage.mjs";
+import { isMain } from "../lib/cli.mjs";
+import { defaultPatchPath, defaultSessionsDir } from "../lib/defaults.mjs";
 import { isContextOverflowText, parseStatedContextLimit } from "../lib/probe-heuristics.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -419,7 +421,8 @@ function main() {
     return;
   }
   if (o.nodeModules) EXTRA_NODE_MODULES = o.nodeModules;
-  if (!o.patch) { console.error("缺少 --patch（或设置 DSH_HOME_PROFILE_PATCH）"); process.exit(2); }
+  if (!o.patch) o.patch = defaultPatchPath(); // v0.4.3：默认检查本机 profile，省得每次 --patch
+  if (!o.sessions) o.sessions = defaultSessionsDir();
   if (!existsSync(o.patch)) { console.error(`读不到补丁：${o.patch}`); process.exit(2); }
 
   let doc;
@@ -487,4 +490,6 @@ function main() {
   process.exit(!sessionsUsable ? 2 : (problems.length || configFailures.length ? 1 : 0));
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) main();
+// v0.4.3：npm link 之后 argv[1] 是 /usr/local/bin/dmc-verify（软链），
+// resolve() 比不出相等，整脚本会「静默什么都不做还 exit 0」。必须比 realpath。
+if (isMain(import.meta.url)) main();
