@@ -883,3 +883,62 @@ test("mock 网关：默认关思考、只有 enable_thinking:true 能开 → can
     assert.match(j.yaml, /reasoningEfforts:/);
   } finally { srv.close(); }
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 12：wire payload 断言（外部评审要求「请求体序列化断言」）
+//   直接调 pi-ai 的 openai-completions 流式实现，打本地假 SSE 端点，
+//   抓真实请求体 —— 不是读代码猜，是真的发出去的字段。
+// ═══════════════════════════════════════════════════════════════════════
+
+async function captureWirePayloads(modelOverride, levels) {
+  const { createServer } = await import("node:http");
+  const bodies = [];
+  const srv = createServer((req, res) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => {
+      bodies.push(JSON.parse(b));
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n');
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}/v1`;
+  const apiPath = join(dirname(PLUGIN), "..", "..", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js");
+  const { stream } = await import(apiPath);
+  const model = { id: "m", name: "m", api: "openai-completions", provider: "custom-wire", baseUrl: base,
+    reasoning: true, input: ["text"], contextWindow: 200000, maxTokens: 16384, ...modelOverride };
+  const ctx = { messages: [{ role: "user", content: "hi" }] };
+  for (const lvl of levels) {
+    const s = stream(model, ctx, { apiKey: "k", ...(lvl === undefined ? {} : { reasoningEffort: lvl }) });
+    for await (const _ of s) { /* drain */ }
+  }
+  srv.close();
+  return bodies;
+}
+
+const skipIfNoPiAi = () => !existsSync(join(dirname(PLUGIN), "..", "..", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js"));
+
+test("wire：qwen 格式不声明 supportsReasoningEffort 时 low/high 请求体完全相同（档位等价）", skipIfNoPiAi, async () => {
+  const bodies = await captureWirePayloads({ compat: { thinkingFormat: "qwen" } }, ["low", "high"]);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].enable_thinking, true);
+  assert.equal(bodies[1].enable_thinking, true);
+  assert.equal(bodies[0].reasoning_effort, undefined, "没声明就不该发 reasoning_effort");
+  assert.deepEqual(bodies[0], bodies[1], "这就是「多档等价」的 wire 证据");
+});
+
+test("wire：qwen + supportsReasoningEffort 时 low/high 真的不同，off 关掉 enable_thinking", skipIfNoPiAi, async () => {
+  const bodies = await captureWirePayloads({ compat: { thinkingFormat: "qwen", supportsReasoningEffort: true } }, ["off", "low", "high"]);
+  assert.equal(bodies[0].enable_thinking, false, "off 必须关思考");
+  assert.equal(bodies[1].reasoning_effort, "low");
+  assert.equal(bodies[2].reasoning_effort, "high");
+  assert.equal(bodies[1].enable_thinking, true);
+});
+
+test("wire：deepseek 格式用 thinking.type 表达开关", skipIfNoPiAi, async () => {
+  const bodies = await captureWirePayloads({ compat: { thinkingFormat: "deepseek" } }, ["off", "high"]);
+  assert.deepEqual(bodies[0].thinking, { type: "disabled" });
+  assert.deepEqual(bodies[1].thinking, { type: "enabled" });
+});

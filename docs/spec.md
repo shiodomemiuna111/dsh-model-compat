@@ -31,7 +31,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 6 个零依赖脚本 + 7 个共享库 + 一份可直接抄的声明模板 + 63 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 6 个零依赖脚本 + 7 个共享库 + 一份可直接抄的声明模板 + 66 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -391,7 +391,7 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 63 条测试的分组
+### 4.2 66 条测试的分组
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -406,6 +406,7 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 9 | 7 | `--yaml` 片段生成（无证据 / 占位窗口 / maxTokens 反推 / 纯推理不写 off / 两形态过三段 / 旧模板反证） |
 | 10 | 9 | v0.3.0：第 3 段压缩预算红绿、fs-safe 原子写与软链、`context-budget --patch`、3 条新审计规则、`thinkingBudgets` 不误报 |
 | 11 | 4 | **mock 网关**：静默丢图→vision=false、真答红→vision=true、`max_tokens>16384` 全 400→gateMaxTokens 收敛、默认关思考→canEnable + qwen |
+| 12 | 3 | **wire payload 断言**：直接调 pi-ai 的 openai-completions 流式实现打本地假端点，抓真实请求体 —— qwen 不声明 `supportsReasoningEffort` 时 low/high 请求体**完全相同**；声明后 `reasoning_effort` 真的不同、`off` 关掉 `enable_thinking`；deepseek 用 `thinking.type` |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
 
@@ -498,7 +499,7 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 
 ```bash
 git clone https://github.com/shiodomemiuna111/dsh-model-compat && cd dsh-model-compat
-npm test                                   # 63 条回归
+npm test                                   # 66 条回归
 npm run selfcheck                          # 测试 + 示例配置两段校验 + 预算
 node scripts/context-budget.mjs --ctx 131072 --max 128000   # 看「为什么会失败」
 ```
@@ -550,7 +551,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 4. **§3.5 的保守取值（`maxTokens` 32768~65536、`contextWindow` 填实测值）** 在大窗口（≥1M）模型上是否会带来不可接受的提前压缩？有没有更优的 headroom/thresholdRatio 组合？
 5. **§3.6 的「没证据就不写 compat」是否过于保守？** 有没有「不写 compat 就一定错」的协议（例如某些网关必须显式 `enable_thinking` 才开思考）？
 6. **§3.7 的写盘纪律** 还有哪些破坏场景没覆盖？（我已知：SIGKILL 残留、`--replace` 注释残留、并发两个进程同时写同一文件未加锁。）
-7. **§4 的证据强度**：63 条测试 + 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
+7. **§4 的证据强度**：66 条测试 + 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
 8. **§5 的边界**里，哪一条在你看来是「必须修才能交付」，哪一条可以接受为已知限制？
 
 ---
