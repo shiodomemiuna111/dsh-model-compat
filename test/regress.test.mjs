@@ -1909,3 +1909,24 @@ test("组 25：默认补丁路径的优先级（env > 本机 profile > 示例）
     Object.assign(process.env, old);
   }
 });
+
+test("组 25：dmc-verify 默认写 JSONL 日志到 $DSH_MODEL_COMPAT_LOG / $DSH_HOME，--no-log 才不写", async () => {
+  const { readFileSync: rf, existsSync: ex } = await import("node:fs");
+  const d = tmp();
+  const logFile = join(d, "verify.jsonl");
+  const sessions = join(d, "sessions");
+  const sdir = join(sessions, "--root-workspace--", "session-l");
+  (await import("node:fs")).mkdirSync(sdir, { recursive: true });
+  const { zstdCompressSync } = await import("node:zlib");
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(JSON.stringify({ type: "request/context", data: { provider: "p", model: "m", contextWindow: 131072 } }) + "\n")));
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      p:\n        api: openai-completions\n        baseURL: https://p.invalid/v1\n        models:\n          - id: m\n            contextWindow: 131072\n            maxTokens: 16384\n            input: [text]\n`);
+  const env = { ...process.env, DSH_MODEL_COMPAT_LOG: logFile };
+  const r1 = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json"], { encoding: "utf8", env });
+  assert.ok(ex(logFile), `默认应当写日志：${r1.stderr?.slice(0, 200)}`);
+  const rec = rf(logFile, "utf8").trim().split("\n").map((x) => JSON.parse(x));
+  assert.equal(rec.at(-1).cmd, "verify-effective");
+  const logFile2 = join(d, "verify2.jsonl");
+  spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json", "--no-log"], { encoding: "utf8", env: { ...process.env, DSH_MODEL_COMPAT_LOG: logFile2 } });
+  assert.equal(ex(logFile2), false, "--no-log 必须真的不写");
+});

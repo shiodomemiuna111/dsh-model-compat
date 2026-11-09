@@ -53,7 +53,7 @@ function parseArgs(argv) {
   const out = {
     patch: process.env.DSH_HOME_PROFILE_PATCH ?? null,
     sessions: process.env.DSH_HOME ? join(process.env.DSH_HOME, "sessions") : join(process.env.HOME ?? "/root", ".dsh", "sessions"),
-    last: 8, json: false, log: null, verbose: false, nodeModules: null,
+    last: 8, json: false, log: DEFAULT_LOG, verbose: false, nodeModules: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
