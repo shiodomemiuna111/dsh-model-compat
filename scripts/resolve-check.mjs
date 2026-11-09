@@ -4,8 +4,11 @@
  * 本机安装的 @deepseek-ai/dsh-llm-pi-ai 正确解析。
  *
  * 用法：
- *   node scripts/resolve-check.mjs                     # 检查当前 profile 的 cordis.patch.yml
+ *   node scripts/resolve-check.mjs                     # 检查 examples/cordis.patch.yml（默认）
  *   node scripts/resolve-check.mjs --patch a.yml       # 检查任意覆盖层（可重复）
+ *
+ * 默认补丁可用环境变量 DSH_HOME_PROFILE_PATCH 指向你自己的
+ * $DSH_HOME/profiles/<name>/cordis.patch.yml，省得每次敲 --patch。
  *   node scripts/resolve-check.mjs --json              # 机器可读输出
  *
  * 退出码：0 = 全部通过；1 = 有路由解析失败；2 = 用法/环境错误

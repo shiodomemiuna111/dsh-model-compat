@@ -109,6 +109,7 @@ docs/method.md                   方法论：为什么不要抄厂商数字
 docs/portability.md              跨版本验证记录与结论
 docs/pitfalls.md                 实操踩坑（含本机实测数据）
 docs/failure-modes.md            失败模式：一条坏声明会不会毒死全局、卡死怎么兜底
+docs/spec.md                     规格书（给外部评审：机制事实 + 方案 + 证据 + 已知边界）
 ```
 
 ## License
