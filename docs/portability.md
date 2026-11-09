@@ -9,7 +9,7 @@
 > `thinkingFormat`、`compat`、思考档位（`thinkingLevelMap`）**没有进比对**
 > —— 所以旧版对这几项的兼容性仍是【未验】，别当成已证明。
 
-同一份包含 3 条路由的 `cordis.patch.yml`，交给 5 个版本的 `@deepseek-ai/dsh-llm-pi-ai` 解析：
+同一份包含 2 条路由的 `cordis.patch.yml`，交给 5 个版本的 `@deepseek-ai/dsh-llm-pi-ai` 解析：
 
 | 插件版本 | 发布日 | 配套 pi-ai | 结果 |
 |---|---|---|---|

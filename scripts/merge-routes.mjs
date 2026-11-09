@@ -22,9 +22,9 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { staticAudit } from "../lib/audit.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
-import { locateProviders, removeRouteBlock, renderManagedBlock, findManagedBlock } from "../lib/yaml-edit.mjs";
+import { locateProviders, removeRouteBlock, renderManagedBlock, findManagedBlock, detectEol, normalizeEol, applyEol } from "../lib/yaml-edit.mjs";
 import { compactionConfigFromPatch } from "../lib/compaction.mjs";
-import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom } from "../lib/fs-safe.mjs";
+import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -178,7 +178,8 @@ for (const f of o.from) {
 
 // ── 4. 冲突检测：目标文件里已有同名路由（且不在托管块内）
 let targetText;
-try { targetText = readFileSync(o.patch, "utf8"); }
+let rawTarget = "";
+try { rawTarget = readFileSync(o.patch, "utf8"); targetText = normalizeEol(rawTarget); }
 catch (e) {
   console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e)}\n（文件不存在 / 是目录 / 没有权限；不会改动任何东西）`);
   process.exit(1);
@@ -251,7 +252,7 @@ if (good.length === 0) {
 }
 
 let target;
-try { target = readFileSync(o.patch, "utf8"); }
+try { target = normalizeEol(readFileSync(o.patch, "utf8")); }
 catch (e) {
   console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e)}（文件不存在 / 是目录 / 没有权限）`);
   process.exit(1);
@@ -301,7 +302,8 @@ function rollback(reason) {
 try {
   // 写入全程不产生「半截文件」：先写同目录临时文件、校验通过才 rename 覆盖目标。
   // 这对被 dsh-hmr 实时监听的 cordis.patch.yml 是必须的（评审意见 6）。
-  atomicWriteFile(realTarget, next, {
+  assertUnchanged(realTarget, contentFingerprint(rawTarget));
+  atomicWriteFile(realTarget, applyEol(next, detectEol(rawTarget)), {
     check: (text) => {
       const d = YAML.parse(text);
       const provs = Array.isArray(d) ? d.find((e) => e?.id === "llm-pi-ai")?.config?.providers : d?.providers;

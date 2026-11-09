@@ -23,10 +23,10 @@ import { readFileSync, writeFileSync, existsSync, mkdtempSync, mkdirSync, symlin
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { locateProviders, removeRouteBlock, renderRouteYaml } from "../lib/yaml-edit.mjs";
+import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normalizeEol, applyEol } from "../lib/yaml-edit.mjs";
 import { pickSafeMaxTokens } from "../lib/compaction.mjs";
 import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
-import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom } from "../lib/fs-safe.mjs";
+import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
 
 const require = createRequire(import.meta.url);
 const argv = process.argv.slice(2);
@@ -41,6 +41,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--display-name") o.displayName = next();
   else if (a === "--dry-run") o.dryRun = true;
   else if (a === "--force") o.force = true;
+  else if (a === "--layer") (o.layers ??= []).push(next());
   else if (a === "--assume-ctx" || a === "--assume-contextWindow") o.assumeCtx = next();
   else if (a === "--max") o.maxOverride = next();
   else if (a === "--api") o.api = next();
@@ -96,13 +97,18 @@ function need(name, value, assume) {
 }
 o.assumeCtx ??= undefined;
 const ctx = need("contextWindow", s.contextWindow, o.assumeCtx);
-const probeMax = s.outputCap;
+// v0.3.4（审计 P1-5）：probe-capabilities 的字段名是 gateMaxTokens；outputCap 是旧名。
+const probeMax = s.gateMaxTokens ?? s.outputCap;
 if (probeMax === null || probeMax === undefined) console.error("警告：输出上限未探测到，退回 --max（默认 65536，保守值）");
 // v0.3.1：maxTokens 不再写死 min(probeMax,65536)，改为按 ctx×0.2 与压缩预算反推，
 // 否则 ctx=131072 + max=65536 会 pressure=0，写进去必然被 compaction-basic 拒。
+// v0.3.4（审计 P1-6）：--max 是用户明确给的上界，必须和探测上限一起参与 min，
+// 否则 --max 1024 会被阶梯/回退越过，写出网关必拒的大值。
+const gateCandidates = [Number(probeMax), Number(o.maxOverride)].filter((v) => Number.isFinite(v) && v > 0);
+const gateMax = gateCandidates.length ? Math.min(...gateCandidates) : null;
 const pick = pickSafeMaxTokens({
   contextWindow: ctx,
-  gateMax: Number(probeMax) || Number(o.maxOverride) || null,
+  gateMax,
   headroomTokens: o.headroom,
 });
 const maxTokens = pick.maxTokens ?? Number(o.maxOverride) ?? 0;
@@ -172,9 +178,18 @@ const profile = {
 };
 
 const YAML = loadYaml();
-let text;
-try { text = readFileSync(o.patch, "utf8"); }
+const { realpathSync } = require("node:fs");
+function resolvePathReal(p) { try { return realpathSync(p); } catch { return p; } }
+let rawText;
+try { rawText = readFileSync(o.patch, "utf8"); }
 catch (e) { console.error(`读不到 ${o.patch}：${String(e?.message ?? e)}`); process.exit(2); }
+// v0.3.4：CRLF 文件必须先归一化，否则按行匹配 `- id: llm-pi-ai` 会因为行尾 \r 全部落空。
+const eol = detectEol(rawText);
+// 指纹必须用在磁盘上的原始内容（含 BOM），否则写前并发校验会误报「被别的进程改过」。
+const originFingerprint = contentFingerprint(rawText);
+// BOM（EF BB BF，Windows 记事本常见）：YAML 解析器会报 Unexpected scalar；直接剥掉再解析。
+if (rawText.charCodeAt(0) === 0xfeff) { rawText = rawText.slice(1); console.error("提示：文件开头有 BOM，已按无 BOM 处理（写回时不再带 BOM）。"); }
+let text = normalizeEol(rawText);
 
 // 缩进从目标文件探测（4 空格缩进的文件也支持）
 let lines = text.split("\n");
@@ -187,15 +202,37 @@ if (lines.length !== text.split("\n").length) {
   text = lines.join("\n");
 }
 const block = renderRouteYaml(o.route, profile, anchor.childIndent, YAML) + "\n";
-const doc = YAML.parse(text);
+let doc;
+try { doc = YAML.parse(text); }
+catch (e) {
+  console.error(`目标文件解析失败（未改动文件）：${String(e?.message ?? e)}`);
+  if (text.charCodeAt(0) === 0xfeff) console.error("  提示：文件开头有 BOM（EF BB BF），Windows 记事本常这么存；用编辑器存成「UTF-8 无 BOM」。");
+  process.exit(1);
+}
 if (!Array.isArray(doc)) { console.error(`${o.patch} 顶层不是数组`); process.exit(2); }
 const entry = doc.find((e) => e?.id === "llm-pi-ai");
 if (!entry) { console.error("补丁里没有 - id: llm-pi-ai 条目，请先按 examples/cordis.patch.yml 建一份"); process.exit(1); }
 const providers = entry.config?.providers ?? {};
 if (providers[o.route]) console.error(`警告：路由 ${o.route} 已存在，将被文本替换覆盖`);
 
-// 第 3 段：压缩预算（用目标文件里 compaction-basic 的真实 headroom/modelPolicies）
-const compactionCfg = compactionConfigFromPatch(doc);
+// ── 分层层叠（审计 P1-9）：DSH 实际加载 home 级 patch + profile 级 patch。
+// 只按目标文件算预算会漏掉 home 里定义的 compaction 配置，写出「预演全绿、启动就炸」的声明。
+const { homedir } = require("node:os");
+const layerPaths = [...(o.layers ?? [])];
+const homePatch = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "cordis.patch.yml");
+if (!o.layers && existsSync(homePatch) && resolvePathReal(homePatch) !== resolvePathReal(o.patch)) layerPaths.unshift(homePatch);
+const layerDocs = [];
+for (const lp of layerPaths) {
+  let ld;
+  try { ld = YAML.parse(readFileSync(lp, "utf8")); }
+  catch (e) { console.error(`读不了叠加层 ${lp}：${String(e?.message ?? e)}`); process.exit(2); }
+  layerDocs.push(Array.isArray(ld) ? ld : []);
+  if (!o.json) console.error(`叠加层：${lp}`);
+}
+
+// 第 3 段：压缩预算（按真实层叠顺序算，后写覆盖前写）
+const compactionCfg = compactionConfigFromPatch([...layerDocs.flat(), ...doc]);
+if (compactionCfg.duplicates?.length) console.error(`警告：层叠后有 ${compactionCfg.duplicates.length + 1} 条 dsh-compaction-basic，按 DSH 语义以最后一条为准`);
 const budget = budgetCheck(compactionCfg);
 if (!budget.ok && !o.force) {
   console.error("拒绝写入，这条声明会让 DSH 启动失败或抖动：");
@@ -205,8 +242,9 @@ if (!budget.ok && !o.force) {
 }
 
 // ── 预演：在临时目录里合并校验（不碰真实文件）
-const merged = structuredClone(doc);
-const mEntry = merged.find((e) => e?.id === "llm-pi-ai");
+const merged = [...layerDocs.flat(), ...structuredClone(doc)];
+// 目标条目要把路由加进去；如果层叠里已有同名路由，最后一条（目标文件）覆盖
+let mEntry = merged.filter((e) => e?.id === "llm-pi-ai").pop();
 mEntry.config ??= {};
 mEntry.config.providers ??= {};
 mEntry.config.providers[o.route] = profile;
@@ -227,7 +265,11 @@ function preflight() {
 }
 const pre = preflight();
 rmSync(tmp, { recursive: true, force: true });
-if (!pre.ok) {
+if (!pre.ok && o.force) {
+  console.error("警告：预演校验失败，但 --force 仍然写入（出问题自己回滚 .bak）：");
+  console.error(pre.out.trim().split("\n").slice(0, 6).map((l) => "  " + l).join("\n"));
+}
+if (!pre.ok && !o.force) {
   console.error("预演校验失败，没有写入文件：");
   console.error(pre.out.trim().split("\n").slice(0, 12).map((l) => "  " + l).join("\n"));
   process.exit(1);
@@ -254,7 +296,8 @@ let bak;
 try { bak = backupFile(o.patch, new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+/, "")); }
 catch (e) { console.error(`无法创建备份：${String(e?.message ?? e)}（目录只读？）未改动文件。`); process.exit(1); }
 try {
-  atomicWriteFile(realTarget, updated, {
+  assertUnchanged(realTarget, originFingerprint);
+  atomicWriteFile(realTarget, applyEol(updated, eol), {
     check: (t) => { YAML.parse(t); },
   });
 } catch (e) {

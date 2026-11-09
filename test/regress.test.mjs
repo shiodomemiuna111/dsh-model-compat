@@ -1052,3 +1052,72 @@ for (const [mechanism, wantFormat, wantEffort] of [["boolean", "qwen", false], [
     } finally { gw.close(); }
   });
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 15：第二轮对抗审计的 P0/P1 回归（v0.3.4）
+//   审计员真跑出来的洞：NaN 死循环、坏 YAML 打栈、重复 compaction 条目、
+//   --max 被回退越过、并发写丢路由、CRLF 文件被拒、BOM 打栈。
+// ═══════════════════════════════════════════════════════════════════════
+
+const ROOT15 = new URL("..", import.meta.url).pathname;
+
+function tmpYaml(name, text) {
+  const p = join(tmpdir(), `g15-${process.pid}-${Math.random().toString(36).slice(2)}-${name}`);
+  writeFileSync(p, text);
+  return p;
+}
+const PROBE15 = JSON.stringify({ base: "https://x.invalid/v1", model: "m", summary: { contextWindow: 200000, gateMaxTokens: 32768, vision: true, thinkingSwitchable: ["enable_thinking:true"], switchFormat: "qwen" } });
+const PATCH15 = `- id: llm-pi-ai\n  config:\n    providers:\n      hand:\n        api: openai-completions\n        baseURL: https://x.invalid/v1\n        models:\n          - id: m\n            contextWindow: 200000\n            maxTokens: 8192\n`;
+
+test("审计 P0-1：context-budget 的 --headroom NaN 必须 exit 2（不能再死循环）", async () => {
+  const r = await runNode([join(ROOT15, "scripts/context-budget.mjs"), "--ctx", "800000", "--max", "65536", "--headroom", "NaN"]);
+  assert.equal(r.code, 2, "NaN 应被参数校验拒绝");
+  assert.match(r.stderr, /需要.个有限数字/);
+});
+
+test("审计 P0-3：context-budget --patch 坏 YAML 友好退出（不打栈）", async () => {
+  const bad = tmpYaml("bad.yml", "- id: [oops\n");
+  const r = await runNode([join(ROOT15, "scripts/context-budget.mjs"), "--patch", bad, "--ctx", "800000", "--max", "65536"]);
+  assert.equal(r.code, 2);
+  assert.ok(!/^\s+at /m.test(r.stderr), "不该出现栈帧");
+  assert.match(r.stderr, /解析 .* 失败/);
+});
+
+test("审计 P0-4：同 id 两条 dsh-compaction-basic，必须按最后一条算（DSH 语义）", async () => {
+  const p = tmpYaml("dup.yml", `- id: dsh-compaction-basic\n  config:\n    headroomTokens: 65536\n- id: dsh-compaction-basic\n  config:\n    headroomTokens: 180000\n${PATCH15}`);
+  const probe = tmpYaml("probe.json", PROBE15);
+  const r = await runNode([join(ROOT15, "scripts/inject-model.mjs"), "--patch", p, "--route", "rd", "--probe", probe, "--assume-ctx", "200000", "--plugin-root", "/opt/dsh/node_modules", "--dry-run"]);
+  assert.equal(r.code, 1, "按 180000 算应被预算拒绝");
+  assert.match(r.stderr + r.stdout, /headroom\(180000\)/, "必须报出 180000 这个 headroom");
+});
+
+test("审计 P1-6：--max 1024 不能被回退越过（写出 1024）", async () => {
+  const p = tmpYaml("m1024.yml", PATCH15);
+  const probe = tmpYaml("probe.json", PROBE15);
+  const r = await runNode([join(ROOT15, "scripts/inject-model.mjs"), "--patch", p, "--route", "r2", "--probe", probe, "--assume-ctx", "200000", "--max", "1024", "--plugin-root", "/opt/dsh/node_modules", "--dry-run"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /maxTokens: 1024/);
+});
+
+test("审计 P2-11：CRLF 文件能 merge，且写回仍是 CRLF", async () => {
+  const p = tmpYaml("crlf.yml", "- id: llm-pi-ai\r\n  config:\r\n    providers:\r\n      hand:\r\n        api: openai-completions\r\n        baseURL: https://x.invalid/v1\r\n        models:\r\n          - id: m\r\n            contextWindow: 262144\r\n");
+  const r = await runNode([join(ROOT15, "scripts/merge-routes.mjs"), "--from", join(ROOT15, "examples/cordis.patch.yml"), "--patch", p, "--plugin-root", "/opt/dsh/node_modules"]);
+  assert.equal(r.code, 0, r.stderr);
+  const out = readFileSync(p, "utf8");
+  assert.ok(out.includes("\r\n"), "写回必须保持 CRLF");
+  assert.ok(out.includes("custom-example-a"), "托管块要写进去");
+});
+
+test("审计 P1-10：两个进程并发写同一 patch，必须有一个明确中止（不能静默丢路由）", async () => {
+  const p = tmpYaml("conc.yml", PATCH15);
+  const probe = tmpYaml("probe.json", PROBE15);
+  const args = (route) => [join(ROOT15, "scripts/inject-model.mjs"), "--patch", p, "--route", route, "--probe", probe, "--assume-ctx", "200000", "--plugin-root", "/opt/dsh/node_modules"];
+  const [a, b] = await Promise.all([runNode(args("rA")), runNode(args("rB"))]);
+  const out = readFileSync(p, "utf8");
+  const okCount = [a, b].filter((r) => r.code === 0).length;
+  const failed = [a, b].filter((r) => r.code !== 0);
+  assert.equal(okCount, 1, "应当只有一个写入成功");
+  assert.equal(failed.length, 1);
+  assert.match(failed[0].stderr + failed[0].stdout, /被另一个进程改过|并发写/);
+});

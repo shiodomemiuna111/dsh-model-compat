@@ -14,14 +14,14 @@
 
 > **v0.3.1**（自审）：`inject-model` 的 `reasoningEfforts` 不再写死；`snippet` 在小窗口下直接判 `fatal` 而不是给出必然被拒的 `maxTokens`；`minContextWindowFor` 计入 `gap>=30000`（4096 → 117829）；qwen 布尔开关只写一档并补 `supportsReasoningEffort`。测试 71 条（组 14 补了 probe 端到端）。
 >
-> **v0.3.0**（对外部评审的回应）：探测判据全部重写（`max_tokens` 阶梯下探、思考双向探测、32×32 纯红 PNG 判颜色、多信号 reasoning 判据）；新增**第 3 段**压缩预算校验（`dsh-compaction-basic` 的 `TargetPressureConfigError` 写前就能抓到）；写盘改 `realpath + 临时文件 + rename` 原子替换；探针移出 `node_modules`；`context-budget --patch` 能读你的 compaction 配置；补 mock 网关测试。测试 47 → **66 条**（含 mock 网关与 wire payload 断言）。
+> **v0.3.0**（对外部评审的回应）：探测判据全部重写（`max_tokens` 阶梯下探、思考双向探测、32×32 纯红 PNG 判颜色、多信号 reasoning 判据）；新增**第 3 段**压缩预算校验（`dsh-compaction-basic` 的 `TargetPressureConfigError` 写前就能抓到）；写盘改 `realpath + 临时文件 + rename` 原子替换；探针移出 `node_modules`；`context-budget --patch` 能读你的 compaction 配置；补 mock 网关测试。测试 → **77 条**（含 mock 网关与 wire payload 断言）。
 
 ---
 
 ## 快速开始
 
 ```bash
-git clone <this-repo> dsh-model-compat && cd dsh-model-compat
+git clone https://github.com/shiodomemiuna111/dsh-model-compat.git && cd dsh-model-compat
 
 # 1) 探能力（--yaml 直接出配置片段；默认不发大请求，加 --window 才探窗口）
 node scripts/probe-capabilities.mjs \

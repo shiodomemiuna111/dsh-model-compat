@@ -2,7 +2,7 @@
 
 ## 为什么不能抄厂商数字
 
-DSH 的模型目录（`@earendil-works/pi-ai` 的 `dist/providers/data/*.json`，43 个厂商、1842 个模型条目）
+DSH 的模型目录（`@earendil-works/pi-ai` 的 `dist/providers/data/*.json`，**42 个厂商的 42 个 `*.json`**（连 `.manifest.json` 共 43 个文件）、**1712 条模型条目**）
 是**静态的**：它知道 OpenAI 官方模型的窗口，但不知道你那个聚合网关后面到底是什么。
 
 当目录没命中时，`@deepseek-ai/dsh-llm-pi-ai` 用默认值填坑：

@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.3.1 ｜ **代码提交**：`5eb5b59`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.3.4 ｜ **代码提交**：`HEAD`（下方「已推送」一节写实际 hash）（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -31,7 +31,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 6 个零依赖脚本 + 7 个共享库 + 一份可直接抄的声明模板 + 66 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 6 个零依赖脚本 + 7 个共享库 + 一份可直接抄的声明模板 + 77 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -57,7 +57,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
 
 `lib/index.js:963-972` 的注释原文：*nothing can interrogate a gateway for its modalities*。这就是设计意图——**网关不会告诉你它支持什么模态**，所以 DSH 不猜，交给用户声明。
 
-**【读码】** 内置目录确实很大但仍是静态的：`/opt/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data/` 下 **43 个厂商文件**、**1712 条模型条目**（按协议分布：openai-completions 695、anthropic-messages 412、bedrock-converse-stream 197、openai-responses 129、openrouter-images 64、typesafe-system-one 50、azure-openai-responses 44、mistral-conversations 34、google-generative-ai 32、pi-messages 28、google-vertex 13、openai-codex-responses 8、cloudflare-workers-ai-system-one 5、openai-decisions 1），其中 `reasoning: true` 1352 条、声明 `image` 模态 1263 条。**没有你那个聚合网关后面的具体模型，这些信息就无从谈起。**
+**【读码】** 内置目录确实很大但仍是静态的：`/opt/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data/` 下 **42 个厂商文件**（`.manifest.json` 也算则是 43 个文件）、**1712 条模型条目**（按协议分布：openai-completions 695、anthropic-messages 412、bedrock-converse-stream 197、openai-responses 129、openrouter-images 64、typesafe-system-one 50、azure-openai-responses 44、mistral-conversations 34、google-generative-ai 32、pi-messages 28、google-vertex 13、openai-codex-responses 8、cloudflare-workers-ai-system-one 5、openai-decisions 1），其中 `reasoning: true` 1352 条、声明 `image` 模态 1263 条。**没有你那个聚合网关后面的具体模型，这些信息就无从谈起。**
 
 ### 1.3 为什么这不算 DSH 的 bug
 
@@ -385,13 +385,13 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 
 | # | 命令 | 结果 | 时间 |
 |---|---|---|---|
-| 1 | `npm test` | **47 pass / 0 fail / 0 skip**（9 个测试组） | 2026-11-09 |
+| 1 | `npm test` | **77 pass / 0 fail / 0 skip**（15 个测试组） | 2026-11-09 |
 | 2 | `npm run selfcheck` | exit 0（测试 + 示例预算 + 示例两段校验） | 2026-11-09 |
 | 3 | `node scripts/resolve-check.mjs --patch /root/.dsh/profiles/web/cordis.patch.yml --lint --budget` | exit 0；5 条真实路由全 ✓，静态审计无问题，预算全绿（gap 444163 / 650486 / 554264 / 554264 / 522486） | 2026-11-09 |
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 66 条测试的分组
+### 4.2 77 条测试的分组（15 组）
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -403,10 +403,13 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 6 | 3 | 自我合并拒绝、重名冲突、`--replace` |
 | 7 | 4 | 「照文档敲就跑不转」的 4 个 CLI bug（G–J） |
 | 8 | 5 | 第二轮对抗审计的静默破坏（缩进假设、重复条目、缺字段、兄弟路由、SIGTERM） |
-| 9 | 7 | `--yaml` 片段生成（无证据 / 占位窗口 / maxTokens 反推 / 纯推理不写 off / 两形态过三段 / 旧模板反证） |
-| 10 | 9 | v0.3.0：第 3 段压缩预算红绿、fs-safe 原子写与软链、`context-budget --patch`、3 条新审计规则、`thinkingBudgets` 不误报 |
+| 9 | 6 | `--yaml` 片段生成（无证据 / 占位窗口 / maxTokens 反推 / 纯推理不写 off / 两形态过三段 / 旧模板反证） |
+| 10 | 10 | v0.3.0：第 3 段压缩预算红绿、fs-safe 原子写与软链、`context-budget --patch`、3 条新审计规则、`thinkingBudgets` 不误报 |
 | 11 | 4 | **mock 网关**：静默丢图→vision=false、真答红→vision=true、`max_tokens>16384` 全 400→gateMaxTokens 收敛、默认关思考→canEnable + qwen |
 | 12 | 3 | **wire payload 断言**：直接调 pi-ai 的 openai-completions 流式实现打本地假端点，抓真实请求体 —— qwen 不声明 `supportsReasoningEffort` 时 low/high 请求体**完全相同**；声明后 `reasoning_effort` 真的不同、`off` 关掉 `enable_thinking`；deepseek 用 `thinking.type` |
+| 13 | 3 | v0.3.1 自审：`snippet` 致命（窗口太小）不写死 `maxTokens`、qwen 单档 / effort 双档 + `supportsReasoningEffort`、`minContextWindowFor` 数值下界（4096→117829） |
+| 14 | 2 | **probe 端到端**：mock 网关模拟「布尔开关端点」与「effort 端点」，跑完整 probe→结论→片段 链路 |
+| 15 | 6 | **第二轮对抗审计的 P0/P1 回归**：NaN 死循环、坏 YAML 打栈、重复 compaction 条目取最后一条、`--max` 被回退越过、CRLF 往返、并发写中止 |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
 
@@ -499,7 +502,7 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 
 ```bash
 git clone https://github.com/shiodomemiuna111/dsh-model-compat && cd dsh-model-compat
-npm test                                   # 66 条回归
+npm test                                   # 77 条回归
 npm run selfcheck                          # 测试 + 示例配置两段校验 + 预算
 node scripts/context-budget.mjs --ctx 131072 --max 128000   # 看「为什么会失败」
 ```

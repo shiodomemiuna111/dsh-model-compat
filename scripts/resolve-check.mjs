@@ -40,7 +40,12 @@ function parseArgs(argv) {
     else if (a === "--budget") out.budget = true;
     else if (a === "--lint") out.lint = true;
     else if (a === "--quiet") out.quiet = true;
-    else if (a === "--headroom") out.headroom = Number(argv[++i]);
+    else if (a === "--headroom") {
+      // v0.3.4（审计 P1-7）：NaN 会让 computeBudget 的比较全为 false → 预算「全绿」。
+      const raw = argv[++i], n = Number(raw);
+      if (raw === undefined || raw === "" || !Number.isFinite(n)) throw new Error(`--headroom 需要有限数字，收到 ${raw === undefined ? "（缺失）" : JSON.stringify(raw)}`);
+      out.headroom = n;
+    }
     else if (a === "-h" || a === "--help") out.help = true;
     else if (a.startsWith("-")) throw new Error(`unknown flag: ${a}`);
     else out.patches.push(a);

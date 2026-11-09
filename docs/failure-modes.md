@@ -70,10 +70,11 @@ DSH 加载 `llm-pi-ai` 配置时用的是 **strict** 校验。strict 是「全�
 哪一条把整份配置毒死，直接点名：
 
 ```
-逐路由隔离检查（strict，一条不过不会拖累别的）：
+逐路由隔离检查（Config + 语义 + 压缩预算，一条不过不会拖累别的）：
   ✓ custom-good [good-model]
-  ✗ custom-broken ← contextWindow must be a positive integer
+  ✗ custom-broken ← Config 层：$.providers.custom-broken.models[0].contextWindow expected number but got 128k
   ✓ custom-also-good [also-model]
+注意：真实 DSH 的校验是"全体或全无"，上面 1 条失败会让整份配置被拒（本脚本只是帮你定位到哪条）。
 ```
 
 **第 2 层 —— `merge-routes.mjs`（真正的批量导入）**：
@@ -90,13 +91,12 @@ node scripts/merge-routes.mjs \
 3. 写前 `.bak` 备份，写完整份文件复验，**复验不过自动回滚**。
 
 ```
-候选 3 条：通过 1，失败 2
+候选 2 条：通过 1，失败 1
   ✓ custom-import-good
-  ✗ custom-import-broken ← contextWindow must be a positive integer
-  ✗ custom-import-silent ← model "silent-model" input 含 "video"（只有 text/image 合法）
+  ✗ custom-import-broken ← Config 层拒绝：$.providers.custom-import-broken.models[0].contextWindow expected number but got 128k
 
 失败的路由没有写进去，其余路由照常生效。
-✓ 已写入 cordis.patch.yml（备份 cordis.patch.yml.bak-...）
+✓ 已写入 cordis.patch.yml（备份 cordis.patch.yml.bak-<UTC时间戳>）
 ```
 
 托管块的形状（块外的手写路由脚本永不改动）：

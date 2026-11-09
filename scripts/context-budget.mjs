@@ -27,15 +27,26 @@ import {
 const require = createRequire(import.meta.url);
 const args = process.argv.slice(2);
 const opt = { json: false, minGap: undefined, patch: null, provider: null, model: null };
+// v0.3.4（审计 P0-1/P1-8）：数值参数必须是有限数。NaN 会让 minContextWindowFor 死循环、
+// 也会让「gap ✓」与 exit code 自相矛盾，所以在解析阶段就拒绝。
 for (let i = 0; i < args.length; i++) {
-  const a = args[i], next = () => args[++i], num = () => Number(args[++i]);
-  if (a === "--ctx" || a === "--context-window") opt.ctx = num();
-  else if (a === "--max" || a === "--max-tokens") opt.max = num();
-  else if (a === "--headroom") opt.headroom = num();
-  else if (a === "--retain-ratio") opt.retainRatio = num();
-  else if (a === "--threshold-ratio") opt.thresholdRatio = num();
-  else if (a === "--retain-tokens") opt.retainTokens = num();
-  else if (a === "--min-gap") opt.minGap = num();
+  const a = args[i], next = () => args[++i];
+  const num = (flag) => {
+    const raw = args[++i];
+    const v = Number(raw);
+    if (raw === undefined || raw === "" || !Number.isFinite(v)) {
+      console.error(`${flag} 需要一个有限数字，收到 ${raw === undefined ? "（缺失）" : JSON.stringify(raw)}`);
+      process.exit(2);
+    }
+    return v;
+  };
+  if (a === "--ctx" || a === "--context-window") opt.ctx = num("--ctx");
+  else if (a === "--max" || a === "--max-tokens") opt.max = num("--max");
+  else if (a === "--headroom") opt.headroom = num("--headroom");
+  else if (a === "--retain-ratio") opt.retainRatio = num("--retain-ratio");
+  else if (a === "--threshold-ratio") opt.thresholdRatio = num("--threshold-ratio");
+  else if (a === "--retain-tokens") opt.retainTokens = num("--retain-tokens");
+  else if (a === "--min-gap") opt.minGap = num("--min-gap");
   else if (a === "--patch") opt.patch = next();
   else if (a === "--provider") opt.provider = next();
   else if (a === "--model") opt.model = next();
@@ -51,8 +62,11 @@ if (opt.patch) {
   let yaml = null;
   for (const t of ["yaml", "/opt/dsh/node_modules/yaml"]) { try { yaml = require(t); break; } catch {} }
   if (!yaml) { console.error("解析 --patch 需要 yaml 模块（试过 yaml 与 /opt/dsh/node_modules/yaml）"); process.exit(2); }
-  const doc = yaml.parse(readFileSync(opt.patch, "utf8"));
+  let doc;
+  try { doc = yaml.parse(readFileSync(opt.patch, "utf8")); }
+  catch (e) { console.error(`解析 ${opt.patch} 失败：${String(e?.message ?? e)}（文件坏了 / 是目录 / 没权限；不会改动任何东西）`); process.exit(2); }
   const cfg = compactionConfigFromPatch(doc);
+  if (cfg.duplicates?.length) console.error(`警告：patch 里 dsh-compaction-basic 出现 ${cfg.duplicates.length + 1} 次，按 DSH 语义以最后一条为准`);
   fromPatch = policyForRoute(cfg, opt.provider, opt.model);
   if (!cfg.found && !opt.json) console.error(`提示：${opt.patch} 里没有 dsh-compaction-basic 配置块，按默认值计算（headroom=${DEFAULT_HEADROOM_TOKENS}）`);
 }
@@ -71,7 +85,9 @@ const budget = computeBudget({
   minGap: opt.minGap,
 });
 
-const minContextWindow = minContextWindowFor(opt.max, budget.headroomTokens ?? DEFAULT_HEADROOM_TOKENS);
+let minContextWindow = null;
+try { minContextWindow = minContextWindowFor(opt.max, budget.headroomTokens ?? DEFAULT_HEADROOM_TOKENS); }
+catch (e) { console.error(`算不出最小窗口：${String(e?.message ?? e)}`); process.exit(2); }
 const out = {
   contextWindow: opt.ctx,
   maxTokens: opt.max,
@@ -100,7 +116,8 @@ else {
   console.log(`  pressure        = ${show(budget.pressureBudgetTokens)}`);
   console.log(`  threshold       = ${budget.thresholdTokens}   ← 到这开始压缩`);
   console.log(`  retain          = ${budget.retainTokens}     ← 压缩后留多少尾巴`);
-  console.log(`  gap             = ${budget.gap}     ${budget.gap >= (opt.minGap ?? 30000) ? "✓" : "✗ 太小，会抖动"}`);
+  const gapText = Number.isFinite(budget.gap) ? String(budget.gap) : "—（预算先失败，算不出来）";
+  console.log(`  gap             = ${gapText}     ${budget.ok ? "✓" : "✗ 见下面的问题"}`);
   if (budget.problems?.length) { console.log("\n问题："); for (const p of budget.problems) console.log(`  ✗ ${p}`); }
   else console.log("\n✓ 这组声明是安全的");
 }
