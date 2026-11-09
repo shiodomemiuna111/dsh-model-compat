@@ -644,12 +644,20 @@ test("片段：纯推理模型不写 off 档；可关才写 off", async () => {
   }).yaml;
   assert.doesNotMatch(pure, /off: null/, pure);
   assert.match(pure, /reasoningEfforts:\n\s+high: "high"/, pure);
+  // v0.3.5（审计）：只有实测到 reasoning_effort 生效（supportsEffort）才写两档
   const closable = buildSnippet({
     base: "https://x.invalid/v1", model: "m", contextWindow: 200000, gateMaxTokens: 32768, visionOk: false,
-    thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, levels: ["low", "high"] },
+    thinking: { format: "openai", defaultOn: true, canDisable: true, canEnable: true, supportsEffort: true, levels: ["low", "high"] },
   }).yaml;
   assert.match(closable, /off: null/);
   assert.match(closable, /low: "low"/);
+  assert.match(closable, /supportsReasoningEffort: true/);
+  const collapsed = buildSnippet({
+    base: "https://x.invalid/v1", model: "m", contextWindow: 200000, gateMaxTokens: 32768, visionOk: false,
+    thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, supportsEffort: false, levels: ["low", "high"] },
+  }).yaml;
+  assert.doesNotMatch(collapsed, /low: "low"/);
+  assert.match(collapsed, /high: "high"/);
 });
 
 test("片段：有无证据两种形态都能通过两段加载 + 压缩联动", skipIfNoPlugin, async () => {

@@ -328,7 +328,9 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | `defaultInput` / `defaultMaxTokens` | —（路由级兜底） | 不写 → 落 1e6 / 128000 | 建议显式写 `[text]` / `65536` |
 | 路由名 | — | 用目录已有 id 会继承目录属性（可能跨协议污染）；未命中则等价手写路由 | 走 OpenAI 兼容反代时统一新建 `custom-*` |
 
-### 3.6 片段生成规则（修过四个真 bug）
+### 3.6 片段生成规则
+
+> **v0.3.1+ 的两条分支（审计补）**：①`pickSafeMaxTokens` 返回 `null`（窗口太小、任何 maxTokens 都过不了预算）时，`buildSnippet` 返回 `fatal: true`，**不写** `maxTokens` / `defaultMaxTokens`，只留一行 `# ⚠ 没算出安全的 maxTokens…`，`probe-capabilities` 收到 fatal 会 `exit 1`；②`supportsEffort`（是否实测到 `reasoning_effort` 真的改变 reasoning）为真时，compat 里才写 `supportsReasoningEffort: true`，否则 `levels` 强制裁成一档（旧版只提示不裁，已修）。返回值形状：`{yaml, chosenMaxTokens, budget, notes[], fatal?}`。（修过四个真 bug）
 
 旧版把 YAML 模板内联在 `probe-capabilities.mjs` 里，产出的片段有四个真问题（前两个由「照文档真敲」审计发现，后两个由外部评审指出）：
 
@@ -460,7 +462,7 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 0.2.2-rc.1    ✓    11/11 …                           ✗      ✗     text,image   ✓/✓/✓
 ```
 
-（`bogus` ✗ = 非法 `thinkingFormat` 被拒；`Qwen` ✗ = 大小写不对被拒；`unknown` 列 = 未知字段被静默接受——这是 DSH 的真实行为，所以本方案用静态审计补这一层。）
+（`bogus` ✗ = 非法 `thinkingFormat` 被拒；`Qwen` ✗ = 大小写不对被拒；`unknown` 列 = 未知字段被静默接受——这是 DSH **Config 层**的真实行为（语义层 0.1.5+ 会 REJECT 路由级未知 compat 键，见 §4.5 注），所以本方案用静态审计补这一层。）
 
 ### 4.6 报错文案对照表（写文档/写测试都依赖这些原文）
 
@@ -561,7 +563,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 
 ## 附录 A：字段与枚举清单（来自源码，测试组 3 会持续对账）
 
-- **路由级字段**（`profile` schema，`lib/index.js:1049-1083`）：`displayName` `api` `baseURL` `apiKeyEnv` `models` `modelOverrides` `compat` `defaultInput` `defaultContextWindow` `defaultMaxTokens` `headers` `reasoning` `thinkingBudgets`（`{minimal,low,medium,high}` 数字）`cacheRetention`（`none|short|long`）`transport`（`sse|websocket|websocket-cached|auto`）`timeoutMs` `websocketConnectTimeoutMs` `streamIdleTimeoutMs` `maxRequestImageBytes` `maxRequestImages` `imageOffloadCountQuantum` `requestImagePixelBudget` `requestImageMaxBytes` `retryPolicy`
+- **路由级字段**（`profile` schema，`lib/index.js:1050-1084`）：`displayName` `api` `baseURL` `apiKeyEnv` `models` `modelOverrides` `compat` `defaultInput` `defaultContextWindow` `defaultMaxTokens` `headers` `reasoning` `thinkingBudgets`（`{minimal,low,medium,high}` 数字）`cacheRetention`（`none|short|long`）`transport`（`sse|websocket|websocket-cached|auto`）`timeoutMs` `websocketConnectTimeoutMs` `streamIdleTimeoutMs` `maxRequestImageBytes` `maxRequestImages` `imageOffloadCountQuantum` `requestImagePixelBudget` `requestImageMaxBytes` `retryPolicy`
 - **模型级字段**：`id` `name` `contextWindow` `maxTokens` `input` `reasoningEfforts` `compat`
 - **只在路由层生效、写进模型层会被静默丢弃**：`api` `baseURL` `provider` `apiKeyEnv` `displayName`
 - **思考档位**：`off` `minimal` `low` `medium` `high` `xhigh` `max`（7 个，`index.js:299`）
