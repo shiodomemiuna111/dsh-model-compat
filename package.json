@@ -18,5 +18,22 @@
     "lint": "node scripts/resolve-check.mjs --lint",
     "test": "node --test test/regress.test.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "bin": {
+    "dmc-probe": "scripts/probe-capabilities.mjs",
+    "dmc-check": "scripts/resolve-check.mjs",
+    "dmc-verify": "scripts/verify-effective.mjs",
+    "dmc-repair": "scripts/repair.mjs",
+    "dmc-merge": "scripts/merge-routes.mjs",
+    "dmc-budget": "scripts/context-budget.mjs",
+    "dmc-matrix": "scripts/probe-matrix.mjs",
+    "dmc-inject": "scripts/inject-model.mjs"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "docs",
+    "examples",
+    "README.md"
+  ]
 }

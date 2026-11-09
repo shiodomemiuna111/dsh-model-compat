@@ -24,9 +24,16 @@ import { staticAudit } from "../lib/audit.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
 import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
 import { createRequire } from "node:module";
-import { resolve as resolvePath, dirname } from "node:path";
+import { resolve as resolvePath, dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { usageText } from "../lib/usage.mjs";
+/** v0.4.2：「装上就能用」——没指定 --patch 时优先检查本机真实 profile，而不是示例。 */
+function defaultLocalPatch() {
+  const home = process.env.DSH_HOME ?? join(homedir(), ".dsh");
+  const p = join(home, "profiles", "web", "cordis.patch.yml");
+  return existsSync(p) ? p : null;
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -308,6 +315,7 @@ async function main() {
 
 const DEFAULT_PATCH =
   process.env.DSH_HOME_PROFILE_PATCH ??
+  defaultLocalPatch() ??
   dirname(dirname(new URL(import.meta.url).pathname)) + "/examples/cordis.patch.yml";
 
 main()
