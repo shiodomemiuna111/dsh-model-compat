@@ -25,6 +25,7 @@ import { verifyLoadPath } from "../lib/load-path.mjs";
 import { locateProviders, removeRouteBlock, renderManagedBlock, findManagedBlock, detectEol, normalizeEol, applyEol } from "../lib/yaml-edit.mjs";
 import { compactionConfigFromPatch } from "../lib/compaction.mjs";
 import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
+import { usageText } from "../lib/usage.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -42,7 +43,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--replace") o.replace = true;
   else if (a === "--dry-run") o.dryRun = true;
   else if (a === "-h" || a === "--help") {
-    console.log("用法：node scripts/merge-routes.mjs --patch <cordis.patch.yml> --from <源.yml> [--from ...] [--dry-run] [--no-verify] [--plugin <dsh-llm-pi-ai 目录>]");
+    console.log(usageText("merge-routes.mjs"));
     process.exit(0);
   } else { console.error(`未知参数 ${a}`); process.exit(2); }
 }
@@ -131,10 +132,26 @@ for (const f of o.from) {
 if (Object.keys(candidates).length === 0) { console.error("没有找到任何候选路由"); process.exit(1); }
 
 // 目标文件里 dsh-compaction-basic 的配置（读到目标文件后才填；先声明避免 TDZ）
+// 修正 P1-3：目标文件的 compaction 配置必须在逐条隔离验证之前读到，
+// 否则 verifyIsolated 拿 null/default 判预算 → --no-verify 能写出 DSH 拒载的配置。
 let targetCompaction = null;
+let targetCompactionReady = false;
 
 // ── 2. 逐路由隔离验证（修复 A：整体解析抛错时降级成逐条结果）
+function loadTargetCompaction() {
+  if (targetCompactionReady) return;
+  try {
+    const d = YAML.parse(readFileSync(o.patch, "utf8"));
+    targetCompaction = compactionConfigFromPatch(d);
+  } catch (e) {
+    console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e).split("\n")[0]}\n（文件不存在 / 是目录 / 没有权限；不会改动任何东西）`);
+    process.exit(1);
+  }
+  targetCompactionReady = true;
+}
+
 async function verifyIsolated() {
+  loadTargetCompaction();
   const good = [], bad = [];
   let batch = null;
   try {
@@ -284,6 +301,25 @@ if (next === target) { console.log("\n文件已是最新，未改动。"); proce
 
 function stamp() {
   return new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "") + "-" + String(Date.now() % 1000).padStart(3, "0");
+}
+
+// 修正 P1-3（后半）：--no-verify 只跳过「写后复验」，写入前的整份压缩预算校验照跑。
+// 否则能写出 DSH 启动即拒的配置还报「✓ 已写入」。
+try {
+  const merged = Object.assign({}, targetProviders);
+  for (const g of good) merged[g.route] = g.profile;
+  const whole = await verifyLoadPath(pluginRoot, merged, "strict", { compaction: targetCompaction });
+  if (whole.budget && whole.budget.ok === false) {
+    console.error(`压缩预算拒绝（未改动文件）：${whole.budget.failures.slice(0, 4).join("；")}`);
+    process.exit(1);
+  }
+  if (!whole.schema.ok) {
+    console.error(`Config 层拒绝（未改动文件）：${whole.schema.error}`);
+    process.exit(1);
+  }
+} catch (e) {
+  console.error(`写入前整份校验无法完成（未改动文件）：${String(e?.message ?? e).split("\n")[0]}`);
+  process.exit(1);
 }
 
 // ── 7. 写前备份（软链先解析）→ 原子写入（临时文件 + rename）→ 复验 → 失败原子回滚

@@ -6,12 +6,14 @@
 > 窗口、模态、思考档位全都落到默认值（1M 上下文 / 128k 输出 / 只收文本），于是会出现
 > 「上下文突然爆」「说看不见图」「思考深度调不了」。**这不是 bug，是没声明。**
 
-本仓库提供 8 个零依赖的 Node 脚本 + 8 个共享库，做四件事：
+本仓库提供 8 个零依赖的 Node 脚本 + 9 个共享库，做四件事：
 
 1. **测**——用真实（便宜的）请求测出这个端点到底有什么能力；
 2. **验**——不启动 DSH，直接让 `dsh-llm-pi-ai` 的校验路径解析你写的 YAML，并顺带算压缩联动数字；
 3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效；
 4. **上线后对账 + 自动修正**——从真实会话记录里查「声明 vs 实际」，按探针结果重算并安全改写，全程留 JSONL 日志（含「上次为什么失败」）。
+
+> **v0.3.8**（三个子代理对 v0.3.7 的对抗审计后的修复）：①`repair --apply` 的数据丢失级 P0——块尾扫描把 providers 下**兄弟路由**也算进被修块，静默删光后续路由还报成功（现用 `findRouteBlock` 按缩进判定，审计给的 `target/keep1/keep2` 场景已复现保留）；②`merge-routes` 逐条隔离校验时用的永远是默认 compaction 配置（`--no-verify` 能写出 DSH 启动必拒的配置），现在写前一定跑整份预算校验；③`probe` 把「HTTP 200 + 错误 JSON」当成功、视觉把否定句当答对，改为必须 `choices` 非空且必须答出 red；④`verify-effective` 全坏会话时假绿、`--no-log` 仍写日志、用历史会话旧 ctx 判矛盾；⑤`compaction` 区分**硬失败**（DSH 真会抛）与**工程警告**（`gap<30000`），保留量优先级照插件 `resolveTargetPolicy`；⑥思考声明显式写 `supportsReasoningEffort: false`（不写=默认 true，实测仍会发 `reasoning_effort`），并修掉 4 条 wire 测试「永远 ✔ 但一行没跑」的空跑；⑦8 个脚本 `--help` 统一到 `lib/usage.mjs`，测试组 19 做双向对账。测试 82 → **87 条（19 组，0 skip）**。
 
 > **v0.3.7**（用户三问：有没有按键 / 怎么知道生效 / 没生效怎么自动修正并记日志）：新增两个脚本 `verify-effective.mjs`（读 `$DSH_HOME/sessions/**/session.v4.jsonl.zstd`，比对运行时 `contextWindow`、实际 inputTokens、真实发图、失败类别）与 `repair.mjs`（默认 dry-run 出 diff，`--apply` 才写：三段校验 → 备份 → 原子写 → 写后复验 → 失败回滚）；新增 `lib/runlog.mjs`（JSONL，下一次尝试自动带出上一次失败原因）；`lib/snippet.mjs` 抽出 `thinkingDecl`，probe / snippet / repair 共用一套「思考怎么声明」规则。测试 77 → **82 条**（组 16/17/18）。
 
@@ -40,13 +42,15 @@ node scripts/resolve-check.mjs --patch examples/cordis.patch.yml \
 node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 ```
 
-输出示例：
+输出示例（对 `examples/cordis.patch.yml` 的真实输出，示例里的 key 是占位符，需要自己替换）：
 
 ```
-✓ custom-apizn / gpt-6.1-sol  ctx=800000  max=65536  input=[text,image]  reasoning=true  levels=low/high
+✓ custom-example-a / example-a-model  ctx=800000  max=65536  input=[text,image]  reasoning=true  levels=low/high  format=qwen
+✓ custom-example-b / example-b-model  ctx=400000  max=32768  input=[text,image]  reasoning=true  levels=high
 
 压缩联动（headroom=65536）：
-  ✓ custom-apizn: threshold=640000 retain=117514 gap=522486
+  ✓ custom-example-a: threshold=640000 retain=117514 gap=522486
+  ✓ custom-example-b: threshold=301696 retain=58757 gap=242939
 ```
 
 ---

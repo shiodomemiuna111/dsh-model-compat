@@ -18,6 +18,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, cpSync, rmSync } fr
 import { execFileSync } from "node:child_process";
 import { join, dirname, resolve as rp } from "node:path";
 import { createRequire } from "node:module";
+import { usageText } from "../lib/usage.mjs";
 
 const require = createRequire(import.meta.url);
 const argv = process.argv.slice(2);
@@ -35,7 +36,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--work") opt.work = next();
   else if (a === "--dsh-root") opt.dshRoot = next();
   else if (a === "--keep") opt.keep = true;
-  else if (a === "-h" || a === "--help") { console.log("用法: probe-matrix.mjs --patch file.yml [--versions a,b] [--work DIR] [--dsh-root DIR]"); process.exit(0); }
+  else if (a === "-h" || a === "--help") { console.log(usageText("probe-matrix.mjs")); process.exit(0); }
   else throw new Error(`unknown flag: ${a}`);
 }
 if (!opt.patch) { console.error("必须给 --patch"); process.exit(2); }

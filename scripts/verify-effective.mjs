@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { computeBudget, compactionConfigFromPatch } from "../lib/compaction.mjs";
 import { logAttempt, appendRecord, DEFAULT_LOG } from "../lib/runlog.mjs";
+import { usageText } from "../lib/usage.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -115,6 +116,7 @@ export function collectFacts(events) {
       facts.set(k, {
         provider, model,
         contextWindows: new Set(),
+        latestContextWindow: null,
         maxInputTokens: 0,
         requests: 0,
         imageMessages: 0,
@@ -136,7 +138,7 @@ export function collectFacts(events) {
       const c = { provider: d.provider ?? "?", model: d.model ?? "?" };
       current.set(e.session, c);
       const f = get(c.provider, c.model);
-      if (Number.isFinite(d.contextWindow)) f.contextWindows.add(d.contextWindow);
+      if (Number.isFinite(d.contextWindow)) { f.contextWindows.add(d.contextWindow); f.latestContextWindow = d.contextWindow; }
       f.sessions.add(e.session);
     } else if (e.type === "request/header") {
       const c = d.header?.config ?? {};
@@ -152,13 +154,13 @@ export function collectFacts(events) {
       f.sessions.add(e.session);
       const u = d.usage ?? {};
       if (Number.isFinite(u.inputTokens)) f.maxInputTokens = Math.max(f.maxInputTokens, u.inputTokens);
-      const content = d.message?.content ?? [];
+      const content = (d.content ?? d.message?.content) ?? [];
       if (Array.isArray(content)) {
         if (content.some((c) => c?.type === "image")) f.imageMessages += 1;
         if (content.some((c) => c?.type === "reasoning")) f.reasoningMessages += 1;
       }
     } else if (e.type === "user/message") {
-      const content = d.message?.content ?? [];
+      const content = (d.content ?? d.message?.content) ?? [];
       if (Array.isArray(content) && content.some((c) => c?.type === "image")) {
         const cfg = curOf(e.session);
         get(cfg.provider, cfg.model).imageMessages += 1;
@@ -216,6 +218,7 @@ export function reconcile({ facts, providers, compaction }) {
         route: routeName, model: id,
         declaredCtx, declaredMax, declaredImage,
         runtimeCtx: fact ? [...fact.contextWindows] : [],
+        latestRuntimeCtx: fact?.latestContextWindow ?? null,
         requests: fact?.requests ?? 0,
         maxInputTokens: fact?.maxInputTokens ?? 0,
         imageUsed: (fact?.imageMessages ?? 0) > 0,
@@ -233,10 +236,16 @@ export function reconcile({ facts, providers, compaction }) {
         continue;
       }
 
+      // v0.3.8（P2-7）：只拿**最近一次**请求的运行时 ctx 判矛盾；更早会话里的旧值
+      // 多半是「声明后来才改的」，判 error 会长期假红，降级成 warning 并说明。
+      const latestCtx = row.latestRuntimeCtx;
+      if (Number.isFinite(latestCtx) && latestCtx !== declaredCtx) {
+        row.issues.push(`最近一次请求的 contextWindow=${latestCtx}，声明是 ${declaredCtx} —— 「声明没生效」或被别的层覆盖`);
+      }
       for (const cw of row.runtimeCtx) {
-        if (cw !== declaredCtx) {
-          row.issues.push(`运行时 contextWindow=${cw}，声明是 ${declaredCtx} —— 「声明没生效」或被别的层覆盖`);
-        }
+        if (cw === declaredCtx) continue;
+        if (Number.isFinite(latestCtx) && cw === latestCtx) continue; // 已在上面算 error
+        row.warnings.push(`历史会话里出现过 contextWindow=${cw}（声明 ${declaredCtx}）—— 若声明是之后才改的，这是旧记录，可忽略`);
       }
       if (row.maxInputTokens >= budget.thresholdTokens && budget.ok) {
         row.issues.push(`最大输入 ${row.maxInputTokens} ≥ 压缩阈值 ${budget.thresholdTokens}：说明声明的大窗口/大 maxTokens 没有让压缩按预期触发`);
@@ -280,7 +289,7 @@ function main() {
   let o;
   try { o = parseArgs(process.argv.slice(2)); } catch (e) { console.error(`用法错误：${String(e.message)}`); process.exit(2); }
   if (o.help) {
-    console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("*/")[0]);
+    console.log(usageText("verify-effective.mjs"));
     return;
   }
   if (!o.patch) { console.error("缺少 --patch（或设置 DSH_HOME_PROFILE_PATCH）"); process.exit(2); }
@@ -313,11 +322,13 @@ function main() {
   const { rows, problems } = reconcile({ facts, providers, compaction });
 
   const log = o.log ?? null;
+  const sessionsUsable = loaded.sessions.length > 0 && loaded.events.length > 0;
   const phases = [
-    { name: "会话记录", ok: loaded.sessions.length > 0, detail: loaded.sessions.length ? `${loaded.sessions.length} 个会话、${loaded.events.length} 条事件${loaded.skipped.length ? `（跳过 ${loaded.skipped.length} 个：${loaded.skipped[0].reason}）` : ""}` : `在 ${o.sessions} 下没找到 session.v4.jsonl.zstd` },
-    { name: "声明对账", ok: problems.length === 0, detail: problems.length ? `${problems.length} 个模型出现「声明与实际」矛盾` : "没有矛盾" },
+    { name: "会话记录", ok: sessionsUsable, detail: sessionsUsable ? `${loaded.sessions.length} 个会话、${loaded.events.length} 条事件${loaded.skipped.length ? `（跳过 ${loaded.skipped.length} 个：${loaded.skipped[0].reason}）` : ""}` : `在 ${o.sessions} 下没有可用会话（找到 ${loaded.skipped.length} 个但读不出：${loaded.skipped.map((x) => x.reason).slice(0, 3).join("；") || "无文件"}）` },
+    { name: "声明对账", ok: problems.length === 0, detail: problems.length ? `${problems.length} 个模型出现「声明与实际」矛盾` : (sessionsUsable ? "没有矛盾" : "没有可用会话，无法对账") },
   ];
-  logAttempt(log ?? DEFAULT_LOG, { cmd: "verify-effective", patch: o.patch, status: problems.length ? "fail" : "ok", phases });
+  // P2-1：o.log === null 表示 --no-log，旧版 `log ?? DEFAULT_LOG` 又把它兜回默认文件。
+  logAttempt(log, { cmd: "verify-effective", patch: o.patch, status: problems.length ? "fail" : (sessionsUsable ? "ok" : "fail"), phases });
 
   if (o.json) {
     console.log(JSON.stringify({ sessions: loaded.sessions, skipped: loaded.skipped, rows, problems, compaction }, null, 2));
@@ -331,9 +342,17 @@ function main() {
       for (const i of r.warnings ?? []) console.log(`    · ${i}`);
     }
     if (!rows.length) console.log("（补丁里没有带 models 的路由）");
-    console.log(problems.length ? `\n结论：${problems.length} 项「声明与实际不一致」——见上。` : "\n结论：没有发现「声明与实际不一致」（未观测到的项标「未使用」，不代表没问题）。");
+    if (!sessionsUsable) {
+      console.log(`\n✗ 没有任何可用的会话记录，无法判断「声明是否生效」。`);
+      console.log(`  查过：${o.sessions}`);
+      for (const s2 of loaded.skipped.slice(0, 5)) console.log(`  读不出：${s2.id} —— ${s2.reason}`);
+      console.log(`  （这不是「没问题」：本脚本判绿的前提是至少读到一份真实会话。）`);
+    } else {
+      console.log(problems.length ? `\n结论：${problems.length} 项「声明与实际不一致」——见上。` : "\n结论：没有发现「声明与实际不一致」（未观测到的项标「未使用」，不代表没问题）。");
+    }
   }
-  process.exit(problems.length ? 1 : 0);
+  // P1-1：读不到任何会话 = 环境错误，exit 2（旧版 0，假绿）
+  process.exit(!sessionsUsable ? 2 : (problems.length ? 1 : 0));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) main();

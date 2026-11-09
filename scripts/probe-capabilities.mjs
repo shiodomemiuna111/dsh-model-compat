@@ -35,6 +35,7 @@ import { buildSnippet } from "../lib/snippet.mjs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { usageText } from "../lib/usage.mjs";
 
 const require = createRequire(import.meta.url);
 // 32×32 纯红 PNG（v0.3.0：1×1 可能被「最小尺寸」限制拒，32×32 更稳）
@@ -124,7 +125,7 @@ async function get(o, key, path) {
 async function main() {
   const o = parseArgs(process.argv.slice(2));
   if (o.help || !o.base || !o.model) {
-    console.log("用法: probe-capabilities.mjs --base URL --model ID (--key K | --key-env NAME) [--yaml] [--json] [--window]");
+    console.log(usageText("probe-capabilities.mjs"));
     return o.help ? 0 : 2;
   }
   const key = loadKey(o);
@@ -165,10 +166,27 @@ async function main() {
     return 0;
   };
   const nonEmpty = (j) => String(j?.choices?.[0]?.message?.content ?? "").trim().length > 0;
+  // v0.3.8（P1-2）：有些网关对一切请求都回 200，body 却是 {"error":{...}} 或干脆没有
+  // choices。旧版只看 status===200，于是「模型不存在」也会被当成成功，还会编造
+  // gateMaxTokens=65536 并 exit 0。这里要求 200 且响应结构像一次成功补全。
+  const looksOk = (r) => r.status === 200 && !r.json?.error && Array.isArray(r.json?.choices) && r.json.choices.length > 0;
 
   // 2 基础（思考型模型可能把 64 token 全烧在推理上，这里重试一次更大预算）
   r = await chat();
-  if (r.status === 200 && !nonEmpty(r.json)) r = await chat({ max_tokens: 1024 });
+  if (looksOk(r) && !nonEmpty(r.json)) r = await chat({ max_tokens: 1024 });
+  if (r.status === 200 && !looksOk(r)) {
+    const detail = `HTTP 200 但响应不是一次成功补全：${JSON.stringify(r.json?.error ?? r.text.slice(0, 200)).slice(0, 240)}`;
+    step("basic-chat", "~20 token", 0, detail);
+    findings.error = "网关对请求返回 200 但 body 是错误/无 choices，探测结论不可信";
+    findings.summary = { gateMaxTokens: null, vision: false, contextWindow: null, error: findings.error };
+    if (o.json) console.log(JSON.stringify(findings, null, 2));
+    else {
+      console.log(`端点 ${o.base}  模型 ${o.model}\n`);
+      for (const st of findings.steps) console.log(`${st.status === 200 ? "✓" : st.status === 0 ? "·" : "✗"} ${st.name.padEnd(14)} ${st.detail}`);
+      console.log(`\n✗ ${findings.error}`);
+    }
+    return 1;
+  }
   save("chat", r);
   step("basic-chat", "~20 token", r.status, r.json?.error ? JSON.stringify(r.json.error).slice(0, 200) : `content=${JSON.stringify(r.json?.choices?.[0]?.message?.content ?? "").slice(0, 40)}`);
 
@@ -181,7 +199,8 @@ async function main() {
   for (const n of MAX_TOKENS_LADDER) {
     const rr = await chat({ max_tokens: n });
     save(`max-tokens-${n}`, rr);
-    if (rr.status === 200) { gateMaxTokens = n; capDetail.push(`${n}✓`); break; }
+    if (looksOk(rr)) { gateMaxTokens = n; capDetail.push(`${n}✓`); break; }
+    if (rr.status === 200) capDetail.push(`${n}✗(200 但无 choices)`);
     capDetail.push(`${n}✗`);
   }
   if (gateMaxTokens === null) {
@@ -273,7 +292,10 @@ async function main() {
   save("vision", r);
   const visionText = String(r.json?.choices?.[0]?.message?.content ?? "").trim();
   const visionTokens = r.json?.usage?.prompt_tokens ?? 0;
-  const visionSaysRed = /\bred\b|红/i.test(visionText);
+  // v0.3.8（P2-4）：旧正则只找 "red"，于是 "I cannot see images, so I cannot tell; if
+  // forced I would not say red" 也算通过。这里先排除否定/看不到图的口吻。
+  const visionNegated = /(cannot|can.?t|unable|not able|no image|don.?t see|不会|看不到|无法|不能)/i.test(visionText);
+  const visionSaysRed = /\bred\b|红/i.test(visionText) && !visionNegated;
   const visionOk = r.status === 200 && visionSaysRed;
   step(
     "vision",
@@ -363,7 +385,7 @@ async function main() {
   // 关键步骤失败才算失败：/models 不可用不算（很多网关不实现），但基础 chat 或输出上限全拒要算；
   // 片段算不出安全配置（窗口太小 / headroom 太大）也算失败——否则用户会拿到一份
   // 必然被 compaction-basic 拒掉、或根本没写 maxTokens 的片段而不知道。
-  const basicOk = findings.steps.some((x) => x.name === "basic-chat" && x.status === 200);
+  const basicOk = findings.steps.some((x) => x.name === "basic-chat" && x.status === 200 && !x.failed);
   if (!basicOk) return 1;
   if (snippet.fatal) {
     console.error(`\n片段不完整：${snippet.notes[snippet.notes.length - 1] ?? "算不出安全的 maxTokens"}`);

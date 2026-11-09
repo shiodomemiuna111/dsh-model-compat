@@ -16,6 +16,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { usageText } from "../lib/usage.mjs";
 import {
   computeBudget,
   compactionConfigFromPatch,
@@ -51,7 +52,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--provider") opt.provider = next();
   else if (a === "--model") opt.model = next();
   else if (a === "--json") opt.json = true;
-  else if (a === "-h" || a === "--help") { console.log("用法: context-budget.mjs --ctx N --max N [--headroom N] [--patch cordis.patch.yml] [--provider P] [--model M] [--json]"); process.exit(0); }
+  else if (a === "-h" || a === "--help") { console.log(usageText("context-budget.mjs")); process.exit(0); }
   else { console.error(`未知参数: ${a}`); process.exit(2); }
 }
 
@@ -98,6 +99,8 @@ const out = {
   retain: budget.retainTokens,
   gap: budget.gap,
   ok: budget.ok,
+  hardFailures: budget.hardFailures ?? [],
+  warnings: budget.warnings ?? [],
   problems: budget.problems ?? [],
   headroomTokens: budget.headroomTokens ?? DEFAULT_HEADROOM_TOKENS,
   thresholdRatio: budget.thresholdRatio,
@@ -117,8 +120,10 @@ else {
   console.log(`  threshold       = ${budget.thresholdTokens}   ← 到这开始压缩`);
   console.log(`  retain          = ${budget.retainTokens}     ← 压缩后留多少尾巴`);
   const gapText = Number.isFinite(budget.gap) ? String(budget.gap) : "—（预算先失败，算不出来）";
-  console.log(`  gap             = ${gapText}     ${budget.ok ? "✓" : "✗ 见下面的问题"}`);
-  if (budget.problems?.length) { console.log("\n问题："); for (const p of budget.problems) console.log(`  ✗ ${p}`); }
-  else console.log("\n✓ 这组声明是安全的");
+  const gapOk = Number.isFinite(budget.gap) ? budget.gap >= (budget.minGap ?? 30000) : false;
+  console.log(`  gap             = ${gapText}     ${!budget.ok ? "✗ 见下面的硬失败" : gapOk ? "✓" : "⚠ 小于工程下限"}`);
+  if ((budget.hardFailures ?? []).length) { console.log("\n硬失败（DSH 会真抛错）："); for (const p of budget.hardFailures) console.log(`  ✗ ${p}`); }
+  if ((budget.warnings ?? []).length) { console.log("\n警告（DSH 不抛，但会反复触发压缩）："); for (const p of budget.warnings) console.log(`  ⚠ ${p}`); }
+  if (!(budget.hardFailures ?? []).length && !(budget.warnings ?? []).length) console.log("\n✓ 这组声明是安全的");
 }
 process.exit(budget.ok ? 0 : 1);

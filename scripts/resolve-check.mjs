@@ -26,6 +26,7 @@ import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib
 import { createRequire } from "node:module";
 import { resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { usageText } from "../lib/usage.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -126,9 +127,7 @@ async function readYamlFile(file, pluginRoot) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log("用法: node scripts/resolve-check.mjs [--patch file.yml ...] [--lint] [--budget] [--json] [--plugin-root DIR]");
-    console.log("  --lint    逐条路由隔离 strict 解析，找出会拖垮整份配置的那一条");
-    console.log("  --budget  计算压缩联动（threshold / retain / gap）");
+    console.log(usageText("resolve-check.mjs"));
     return 0;
   }
   // 帮助优先：--quiet 只压正常输出，不吞 --help 与错误

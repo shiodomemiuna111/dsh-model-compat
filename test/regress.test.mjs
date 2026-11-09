@@ -913,32 +913,54 @@ async function captureWirePayloads(modelOverride, levels) {
   });
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${srv.address().port}/v1`;
-  const apiPath = join(dirname(PLUGIN), "..", "..", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js");
+  const apiPath = join(dirname(PLUGIN), "..", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js");
   const { stream } = await import(apiPath);
   const model = { id: "m", name: "m", api: "openai-completions", provider: "custom-wire", baseUrl: base,
     reasoning: true, input: ["text"], contextWindow: 200000, maxTokens: 16384, ...modelOverride };
   const ctx = { messages: [{ role: "user", content: "hi" }] };
   for (const lvl of levels) {
-    const s = stream(model, ctx, { apiKey: "k", ...(lvl === undefined ? {} : { reasoningEffort: lvl }) });
+    // DSH 自己在调用 pi-ai 前把 off 转成 undefined（dsh-llm-pi-ai/lib/index.js:1791
+    // `const enabledReasoning = reasoning === "off" ? void 0 : reasoning`），
+    // 所以这里也要照做——直接传字符串 "off" 会被 pi-ai 当成「开思考」。
+    const effort = lvl === "off" ? undefined : lvl;
+    const s = stream(model, ctx, { apiKey: "k", ...(effort === undefined ? {} : { reasoningEffort: effort }) });
     for await (const _ of s) { /* drain */ }
   }
   srv.close();
   return bodies;
 }
 
-const skipIfNoPiAi = () => !existsSync(join(dirname(PLUGIN), "..", "..", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js"));
+// v0.3.8（审计 v0.3.7 的 5b）：原来写成函数 `() => !existsSync(...)`，传进
+// test(name, skipIfNoPiAi, fn) 时 node:test 把第二参当成「测试体」，第三参被忽略
+// → 三条 wire 测试永远 ✔ 但一行都没跑。这里必须是「选项对象」，不是函数。
+const PI_AI_OPENAI_COMPLETIONS = join(dirname(PLUGIN), "..", "@earendil-works", "pi-ai", "dist", "api", "openai-completions.js");
+const skipIfNoPiAi = existsSync(PI_AI_OPENAI_COMPLETIONS) ? {} : { skip: "本机没装 @earendil-works/pi-ai，跳过 wire 断言" };
 
-test("wire：qwen 格式不声明 supportsReasoningEffort 时 low/high 请求体完全相同（档位等价）", skipIfNoPiAi, async () => {
+test("wire：不声明 supportsReasoningEffort 时 pi-ai 默认仍会发 reasoning_effort（v0.3.8 更正）", skipIfNoPiAi, async () => {
+  // 这条记录的是 pi-ai 的**默认行为**：未知 provider 的 getCompat 默认
+  // supportsReasoningEffort=true（index.js:1273/:1318）。所以「不写 compat」不等于
+  // 「不发档位字段」——旧文档说「没声明就不发」是错的，实测会发。
   const bodies = await captureWirePayloads({ compat: { thinkingFormat: "qwen" } }, ["low", "high"]);
   assert.equal(bodies.length, 2);
   assert.equal(bodies[0].enable_thinking, true);
-  assert.equal(bodies[1].enable_thinking, true);
-  assert.equal(bodies[0].reasoning_effort, undefined, "没声明就不该发 reasoning_effort");
-  assert.deepEqual(bodies[0], bodies[1], "这就是「多档等价」的 wire 证据");
+  assert.equal(bodies[0].reasoning_effort, "low", "默认会发 low");
+  assert.equal(bodies[1].reasoning_effort, "high", "默认会发 high");
+});
+
+test("wire：显式 supportsReasoningEffort:false 时只发布尔开关、low/high 请求体完全相同（真·档位等价）", skipIfNoPiAi, async () => {
+  const bodies = await captureWirePayloads({ compat: { thinkingFormat: "qwen", supportsReasoningEffort: false } }, ["low", "high"]);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].enable_thinking, true);
+  assert.equal(bodies[0].reasoning_effort, undefined, "显式 false 后不该发 reasoning_effort");
+  assert.deepEqual(bodies[0], bodies[1], "这才是「布尔开关端点多档等价」的 wire 证据");
 });
 
 test("wire：qwen + supportsReasoningEffort 时 low/high 真的不同，off 关掉 enable_thinking", skipIfNoPiAi, async () => {
-  const bodies = await captureWirePayloads({ compat: { thinkingFormat: "qwen", supportsReasoningEffort: true } }, ["off", "low", "high"]);
+  // 必须有 reasoningEfforts 才存在 off 档；否则 pi-ai 不认 "off" 这个级别。
+  const bodies = await captureWirePayloads({
+    compat: { thinkingFormat: "qwen", supportsReasoningEffort: true },
+    reasoningEfforts: { off: null, low: "low", high: "high" },
+  }, ["off", "low", "high"]);
   assert.equal(bodies[0].enable_thinking, false, "off 必须关思考");
   assert.equal(bodies[1].reasoning_effort, "low");
   assert.equal(bodies[2].reasoning_effort, "high");
@@ -946,7 +968,10 @@ test("wire：qwen + supportsReasoningEffort 时 low/high 真的不同，off 关�
 });
 
 test("wire：deepseek 格式用 thinking.type 表达开关", skipIfNoPiAi, async () => {
-  const bodies = await captureWirePayloads({ compat: { thinkingFormat: "deepseek" } }, ["off", "high"]);
+  const bodies = await captureWirePayloads({
+    compat: { thinkingFormat: "deepseek" },
+    reasoningEfforts: { off: null, high: "high" },
+  }, ["off", "high"]);
   assert.deepEqual(bodies[0].thinking, { type: "disabled" });
   assert.deepEqual(bodies[1].thinking, { type: "enabled" });
 });
@@ -980,7 +1005,9 @@ test("snippet：qwen 只证明开关能变时只写一档，且过自审不再�
     thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, levels: ["high"], supportsEffort: false },
   });
   assert.equal((boolSwitch.yaml.match(/^\s+(low|high):/gm) ?? []).length, 1, "只该有一档（off 之外）");
-  assert.equal(/supportsReasoningEffort/.test(boolSwitch.yaml), false);
+  // v0.3.8：不写不等于不发——pi-ai 对未知 provider 默认 supportsReasoningEffort=true，
+  // 所以「确认不支持档位」时必须显式写 false（审计 5a）。
+  assert.equal(/supportsReasoningEffort: false/.test(boolSwitch.yaml), true, "必须显式写 false，否则 pi-ai 默认仍发 reasoning_effort");
 
   if (YAML) {
     const doc = YAML.parse(boolSwitch.yaml.replace(/^\s{6}/gm, "").replace(/^custom-/, "- ") === "" ? "" : `providers:\n${boolSwitch.yaml.replace(/\n/g, "\n")}`);
@@ -1001,8 +1028,12 @@ test("compaction：minContextWindowFor 计入 gap/retain（不只是 max+headroo
   const { minContextWindowFor, computeBudget } = await import(new URL("../lib/compaction.mjs", import.meta.url).pathname);
   const min = minContextWindowFor(4096, 65536);
   assert.equal(min, 117829, "max=4096 headroom=65536 的真实下界");
-  assert.equal(computeBudget({ contextWindow: min, reservedCompletionTokens: 4096, headroomTokens: 65536 }).ok, true);
-  assert.equal(computeBudget({ contextWindow: min - 1, reservedCompletionTokens: 4096, headroomTokens: 65536 }).ok, false);
+  const atMin = computeBudget({ contextWindow: min, reservedCompletionTokens: 4096, headroomTokens: 65536 });
+  assert.equal(atMin.ok, true);
+  assert.equal(atMin.warnings.length, 0, "正好达标的窗口不该再有警告");
+  const below = computeBudget({ contextWindow: min - 1, reservedCompletionTokens: 4096, headroomTokens: 65536 });
+  assert.equal(below.ok, true, "gap 不足只是工程警告，DSH 本身不会拒（v0.3.8 区分硬失败/warning）");
+  assert.equal(below.warnings.some((w) => /gap|30000/i.test(w)), true, "但必须给出 gap 警告");
   assert.notEqual(min, 4096 + 65536 + 1, "不能再只算 pressure");
 });
 
@@ -1148,7 +1179,9 @@ test("verify-effective：抓到「运行时 contextWindow 与声明不符」和�
     { type: "request/context", data: { provider: "custom-x", model: "m", contextWindow: 131072 } },
     { type: "request/header", data: { header: { config: { provider: "custom-x", model: "m" } } } },
     { type: "assistant/message", data: { usage: { inputTokens: 900000 }, message: { content: [{ type: "text", text: "hi" }] } } },
-    { type: "user/message", data: { message: { content: [{ type: "image", source: "x" }, { type: "text", text: "看图" }] } } },
+    // v0.3.8（审计 v0.3.7 的 7）：真实会话里 user/message 的图在 data.content，
+    // 不是 data.message.content（fixture 之前按错路径造假，所以测试自洽通过）。
+    { type: "user/message", data: { content: [{ type: "image", source: "x" }, { type: "text", text: "看图" }] } },
     {
       type: "assistant/attempt",
       data: { stream: [{ chunk: { reason: { kind: "error", failure: { message: "400 context_length_exceeded: maximum context length is 131072 tokens" } } } }] },
@@ -1166,20 +1199,35 @@ test("verify-effective：抓到「运行时 contextWindow 与声明不符」和�
   assert.equal(out.problems.length, 1, r.stdout.slice(0, 600));
   const p = out.problems[0];
   const all = p.issues.join(" | ");
-  assert.match(all, /运行时 contextWindow=131072/, all);
+  assert.match(all, /contextWindow=131072/, all);
   assert.match(all, /context-overflow/, all);
   assert.match(all, /image/, all);
 });
 
 test("verify-effective：会话里没有该模型时不报错（只标「未使用」）", async () => {
   const d = tmp();
-  const sessions = join(d, "sessions");
+  const sessions = join(d, "sessions", "s1");
+  const fsm = await import("node:fs");
+  fsm.mkdirSync(sessions, { recursive: true });
+  const { zstdCompressSync } = await import("node:zlib");
+  // 会话里只有另一个模型：目标模型应判「未使用」而不是「矛盾」（v0.3.8 后无会话是 exit 2，
+  // 所以这里必须造一份真实会话，否则测的是「环境错误」而不是「未使用」）。
+  const events = [
+    { type: "request/context", data: { provider: "other", model: "other-m", contextWindow: 131072 } },
+    { type: "assistant/message", data: { usage: { inputTokens: 10, outputTokens: 5 }, content: [{ type: "text", text: "hi" }] } },
+  ];
+  writeFileSync(join(sessions, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
   const patch = join(d, "p.yml");
   writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      custom-y:\n        api: openai-completions\n        baseURL: https://y.invalid/v1\n        models:\n          - id: never\n            contextWindow: 200000\n            maxTokens: 8192\n`);
-  const r = execFileSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json", "--no-log"], { encoding: "utf8" });
-  const out = JSON.parse(r);
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", join(d, "sessions"), "--json", "--no-log"], { encoding: "utf8" });
+  const out = JSON.parse(r.stdout);
   assert.equal(out.problems.length, 0);
   assert.match(out.rows[0].verdict, /未使用/);
+
+  // 反证：完全没有可用会话时必须 exit 2 且不报「没有发现不一致」（审计 P1-1）
+  const empty = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", join(d, "nope"), "--no-log"], { encoding: "utf8" });
+  assert.equal(empty.status, 2, `没有会话时应 exit 2，实际 ${empty.status}`);
+  assert.match(empty.stdout, /没有任何可用的会话记录/);
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1214,7 +1262,7 @@ test("repair：默认 dry-run 只给 diff、不写盘；--apply 才写，且写�
   const after = readFileSync(patch, "utf8");
   assert.match(after, /contextWindow: 131072/);
   assert.match(after, /maxTokens: 16384/);
-  assert.doesNotMatch(after, /supportsReasoningEffort/, "探针说 thinkingSupportsEffort=false：不该写 supportsReasoningEffort");
+  assert.match(after, /supportsReasoningEffort: false/, "探针说 thinkingSupportsEffort=false：要显式写 false（不写等于默认 true）");
   assert.doesNotMatch(after, /low: low/);
   const baks = readdirSync(d).filter((f) => f.includes(".bak-"));
   assert.ok(baks.length >= 1, `应留下备份，实际：${readdirSync(d).join(",")}`);
@@ -1240,6 +1288,68 @@ test("repair：窗口太小算不出 maxTokens 时拒绝写盘（不猜），exi
   } catch (e) { code = e.status; assert.match(String(e.stderr), /没有任何 maxTokens 能过压缩预算/); }
   assert.equal(code, 1);
   assert.equal(readFileSync(patch, "utf8"), original, "不可修正时必须一字不改");
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 20：与 dsh-compaction-basic 真判定对齐（审计 v0.3.7 的 4/6）
+//   ① 保留量优先级：policy.retainRatio 必须压过全局 retainTokens
+//   ② headroomTokens 非正整数 = 插件加载期硬失败
+//   ③ gap < 工程下限只算警告，不是 ok=false（否则「工具红、DSH 绿」）
+// ═══════════════════════════════════════════════════════════════════════
+test("组 20：policy 的 retainRatio 压过全局 retainTokens（照插件 resolveRetention）", async () => {
+  const { computeBudget, policyForRoute } = await import("../lib/compaction.mjs");
+  const cfg = { headroomTokens: 65536, thresholdRatio: 0.8, retainRatio: 0.16, retainTokens: 4000,
+    modelPolicies: [{ provider: "p", model: "m", retainRatio: 0.5 }] };
+  const pol = policyForRoute(cfg, "p", "m");
+  assert.equal(pol.retainRatio, 0.5);
+  assert.equal(pol.retainTokens, undefined, "全局 retainTokens 不能盖掉 policy 的 retainRatio");
+  const b = computeBudget({ contextWindow: 200000, reservedCompletionTokens: 100000,
+    headroomTokens: pol.headroomTokens, thresholdRatio: pol.thresholdRatio,
+    retainRatio: pol.retainRatio, retainTokens: pol.retainTokens });
+  assert.equal(b.retainTokens, 50000, "B=100000 × 0.5");
+  assert.equal(b.ok, false, "retain(50000) ≥ threshold(34464)：DSH 首个压缩请求就会抛错");
+});
+
+test("组 20：headroomTokens=0 是加载期硬失败（插件 assertPositiveInteger）", async () => {
+  const { computeBudget } = await import("../lib/compaction.mjs");
+  const b = computeBudget({ contextWindow: 200000, reservedCompletionTokens: 10000, headroomTokens: 0 });
+  assert.equal(b.ok, false);
+  assert.match(b.hardFailures.join(" "), /headroomTokens \(0\) 必须是正整数/);
+});
+
+test("组 20：gap 小于工程下限只是警告，不冒充 DSH 硬失败", async () => {
+  const { computeBudget } = await import("../lib/compaction.mjs");
+  const b = computeBudget({ contextWindow: 100000, reservedCompletionTokens: 20000, headroomTokens: 65536 });
+  assert.equal(b.ok, true, "DSH 不检 gap，这条必须 ok");
+  assert.ok(b.warnings.some((w) => /gap/.test(w)), "但要给出工程警告");
+  assert.equal(b.hardFailures.length, 0);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 19：--help 与真实接受的参数不漂移（审计 v0.3.7 的硬伤 4）
+// 机制：用法文本集中在 lib/usage.mjs；这里拿它的 flag 列表与各脚本源码里
+// 真正出现的 "--xxx" 字面量对账（双向）。文档参数表也引用同一份文本。
+// ═══════════════════════════════════════════════════════════════════════
+test("组 19：每个脚本的 --help 完整覆盖它真正接受的参数（双向，无漂移）", async () => {
+  const { USAGE, flagsOf } = await import("../lib/usage.mjs");
+  const names = readdirSync(join(ROOT, "scripts")).filter((f) => f.endsWith(".mjs")).sort();
+  assert.deepEqual(Object.keys(USAGE).sort(), names, "lib/usage.mjs 的键必须与 scripts/ 下的脚本一一对应");
+  for (const name of names) {
+    const src = readFileSync(join(ROOT, "scripts", name), "utf8");
+    const accepted = new Set();
+    // 只认「参数解析行」里的写法（该行含 a === "--x"），不能扫全文件 ——
+    // 脚本内部调用别的脚本时也会出现 "--lint" 这类字面量。
+    for (const line of src.split("\n")) {
+      if (!/\ba === "--/.test(line)) continue;
+      for (const m of line.matchAll(/"(--[A-Za-z][A-Za-z0-9-]*)"/g)) accepted.add(m[1]);
+    }
+    for (const extra of ["--help"]) accepted.add(extra);
+    const documented = new Set(flagsOf(name).concat(["--help"]));
+    const missing = [...accepted].filter((f) => !documented.has(f)).sort();
+    const phantom = [...documented].filter((f) => !accepted.has(f)).sort();
+    assert.deepEqual(missing, [], `${name} 的 --help 漏了实现里接受的参数：${missing.join(", ")}`);
+    assert.deepEqual(phantom, [], `${name} 的 --help 写了实现不认识的参数：${phantom.join(", ")}`);
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════

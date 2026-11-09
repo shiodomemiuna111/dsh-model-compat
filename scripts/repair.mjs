@@ -28,9 +28,10 @@ import { createRequire } from "node:module";
 import { pickSafeMaxTokens, compactionConfigFromPatch } from "../lib/compaction.mjs";
 import { thinkingDecl } from "../lib/snippet.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
-import { resolveWriteTarget, backupFile, atomicWriteFile, rollbackFrom } from "../lib/fs-safe.mjs";
-import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normalizeEol, applyEol } from "../lib/yaml-edit.mjs";
+import { resolveWriteTarget, backupFile, atomicWriteFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
+import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normalizeEol, applyEol, findRouteBlock } from "../lib/yaml-edit.mjs";
 import { logAttempt, logChange, attemptKey, DEFAULT_LOG } from "../lib/runlog.mjs";
+import { usageText } from "../lib/usage.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -77,7 +78,14 @@ function locatePluginRoot(r) {
 
 const normBase = (u) => String(u ?? "").trim().replace(/\/+$/, "").toLowerCase();
 const hostOf = (u) => { try { return new URL(u).host.toLowerCase(); } catch { return ""; } };
-const sameEndpoint = (a, b) => Boolean(a && b) && (normBase(a) === normBase(b) || (hostOf(a) !== "" && hostOf(a) === hostOf(b)));
+// v0.3.8（P2-6）：旧版只比 host，同主机不同 scheme/path 会被当成同一端点，
+// 可能把 A 端点的探针结果写到 B 端点路由。这里要求 scheme+host+path 全等
+// （host 相同、路径不同但 baseURL 只差末尾斜杠的情况由 normBase 兜住）。
+const fullOf = (u) => {
+  try { const x = new URL(u); return `${x.protocol}//${x.host}${x.pathname.replace(/\/+$/, "")}`.toLowerCase(); }
+  catch { return ""; }
+};
+const sameEndpoint = (a, b) => Boolean(a && b) && (normBase(a) === normBase(b) || (fullOf(a) !== "" && fullOf(a) === fullOf(b)));
 
 /** verifyLoadPath 返回 {schema, semantic, routes, budget}（没有顶层 ok）——这里统一成一个结论。 */
 function flattenVerify(res) {
@@ -97,7 +105,7 @@ const fmt = (v) => (v === undefined ? "（不写）" : JSON.stringify(v));
 async function main() {
   let o;
   try { o = parseArgs(process.argv.slice(2)); } catch (e) { console.error(`用法错误：${String(e.message)}`); process.exit(2); }
-  if (o.help) { console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("*/")[0]); return; }
+  if (o.help) { console.log(usageText("repair.mjs")); return; }
   if (!o.patch) { console.error("缺少 --patch（或设置 DSH_HOME_PROFILE_PATCH）"); process.exit(2); }
   if (!o.probe) { console.error("缺少 --probe：请先用 probe-capabilities.mjs --json 生成探测结果"); process.exit(2); }
   if (!existsSync(o.patch)) { console.error(`读不到补丁：${o.patch}`); process.exit(2); }
@@ -167,7 +175,19 @@ async function main() {
     }
     if (!measuredCtx) console.error(`提示：${t.routeName}/${m.id} 没测到窗口，沿用现有 ${ctx}；建议以后加 --window 实测。`);
 
-    const pick = pickSafeMaxTokens({ contextWindow: ctx, gateMax: summary.gateMaxTokens ?? null, headroomTokens: localHeadroom });
+    // v0.3.8（P1-5）：只有真测到网关上限（gateMaxTokens / 旧版 outputCap）才允许
+    // 按 min(gate, ctx×0.2) 反推；没测到就「只能降不能升」，绝不拿「没测到」当「没上限」。
+    const measuredGate = Number.isFinite(summary.gateMaxTokens) ? summary.gateMaxTokens
+      : (Number.isFinite(summary.outputCap) ? summary.outputCap : null);
+    const pick = pickSafeMaxTokens({ contextWindow: ctx, gateMax: measuredGate, headroomTokens: localHeadroom });
+    if (measuredGate === null && pick.maxTokens !== null) {
+      const cur = Number.isFinite(m.maxTokens) ? m.maxTokens : pick.maxTokens;
+      if (pick.maxTokens > cur) {
+        // 没有上限证据：保持现状（只能降），并在提示里说明为什么没照「ctx×0.2」调大
+        pick.maxTokens = cur;
+        pick.reason = `没测到网关输出上限（probe 里没有 gateMaxTokens），不向上调整 maxTokens，保持 ${cur}`;
+      }
+    }
     if (pick.maxTokens === null) {
       blockers.push(`${t.routeName}/${m.id}：窗口 ${ctx} 下没有任何 maxTokens 能过压缩预算（${pick.reason}）——需要调小 headroomTokens 或换更大窗口的模型`);
       continue;
@@ -184,7 +204,8 @@ async function main() {
         return cur;
       })(),
     };
-    const decl = thinkingDecl({
+    const switchableKnownEmpty = Array.isArray(summary.thinkingSwitchable) && summary.thinkingSwitchable.length === 0;
+    const decl = switchableKnownEmpty ? { compat: null, efforts: false, notes: ["探针明确「开不了思考」（thinkingSwitchable=[]）：不写 compat/reasoningEfforts"] } : thinkingDecl({
       format: summary.switchFormat ?? null,
       defaultOn: summary.thinkingDefaultOn === true,
       canDisable: summary.thinkingCanDisable === true,
@@ -262,9 +283,13 @@ async function main() {
     if (c.decl.compat) m.compat = { ...(m.compat && typeof m.compat === "object" ? m.compat : {}), ...c.decl.compat };
     else if (m.compat && typeof m.compat === "object") { delete m.compat.thinkingFormat; delete m.compat.supportsReasoningEffort; if (!Object.keys(m.compat).length) delete m.compat; }
   }
+  // 修正 P2-2：只校验这次真正改动的路由。整份校验会让「无关路由本来就不合理」
+  // 把目标路由也卡死（安全但用户无法修任何东西）。
+  const touched = {};
+  for (const c of pending) touched[c.routeName] = providers[c.routeName];
   let pre;
   try {
-    pre = flattenVerify(await verifyLoadPath(pluginRoot, providers, "strict", { compaction }));
+    pre = flattenVerify(await verifyLoadPath(pluginRoot, touched, "strict", { compaction }));
   } catch (e) {
     console.error(`写前校验跑不起来（未改动文件）：${String(e?.message ?? e)}`);
     logAttempt(o.log, { cmd: "repair", patch: o.patch, status: "fail", phases: [{ name: "写前校验", ok: false, detail: String(e?.message ?? e) }] });
@@ -286,15 +311,13 @@ async function main() {
     rendered.set(c.routeName, block);
   }
   // 从后往前替换，避免索引错位：先按原始文本定位每个路由块的起止
+  // v0.3.8（P0-1）：用 findRouteBlock —— 兄弟路由同缩进，旧扫描会把它们吞掉。
   const curLines = next.split("\n");
   const spots = [];
   for (const routeName of rendered.keys()) {
-    const keyLine = `${" ".repeat(childIndent)}${routeName}:`;
-    const i = curLines.findIndex((l) => l === keyLine);
-    if (i < 0) { console.error(`找不到路由 ${routeName} 的键行（缩进或引号可能不同），未改动文件`); process.exit(1); }
-    let j = i + 1;
-    while (j < curLines.length && (curLines[j].trim() === "" || /^\s/.test(curLines[j]))) j += 1;
-    spots.push({ i, j, block: rendered.get(routeName) });
+    const r = findRouteBlock(curLines, routeName, childIndent);
+    if (!r) { console.error(`找不到路由 ${routeName} 的键行（缩进或引号可能不同），未改动文件`); process.exit(1); }
+    spots.push({ i: r.start, j: r.end, block: rendered.get(routeName) });
   }
   spots.sort((a, b) => b.i - a.i);
   for (const s of spots) {
@@ -303,10 +326,13 @@ async function main() {
   const outText = applyEol(next, eol);
 
   // ── 6. 备份 + 原子写 ──
+  // v0.3.8（P1-4）：读入 → 计算 → 写盘之间有秒级窗口，别人在这期间改了文件，
+  // 旧版会整份覆盖（丢更新）还报成功。写前核对内容指纹，变了就中止。
   const { target } = resolveWriteTarget(o.patch);
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
   let bak = null;
   try {
+    assertUnchanged(target, contentFingerprint(rawText));
     bak = backupFile(target, stamp);
     atomicWriteFile(target, outText, {
       check: (content) => {

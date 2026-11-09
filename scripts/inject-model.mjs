@@ -27,6 +27,7 @@ import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normaliz
 import { pickSafeMaxTokens } from "../lib/compaction.mjs";
 import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
 import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
+import { usageText } from "../lib/usage.mjs";
 
 const require = createRequire(import.meta.url);
 const argv = process.argv.slice(2);
@@ -45,7 +46,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--assume-ctx" || a === "--assume-contextWindow") o.assumeCtx = next();
   else if (a === "--max") o.maxOverride = next();
   else if (a === "--api") o.api = next();
-  else if (a === "-h" || a === "--help") { console.log("用法见 scripts/inject-model.mjs 顶部注释"); process.exit(0); }
+  else if (a === "-h" || a === "--help") { console.log(usageText("inject-model.mjs")); process.exit(0); }
   else { console.error(`未知参数: ${a}`); process.exit(2); }
 }
 if (!o.patch || !o.route || !o.probe) { console.error("必须给 --patch / --route / --probe"); process.exit(2); }
