@@ -145,6 +145,18 @@ test("缺 contextWindow / maxTokens 会提示「这是兜底值」", () => {
   assert.ok(codes.includes("default-max-tokens"));
 });
 
+test("compat 值为 null 在路由级与模型级都会被报出来（真实解析报 with no value）", () => {
+  const routeLevel = auditCodes({ r: { baseURL: "https://x/v1", compat: { thinkingFormat: null }, models: [{ id: "m" }] } });
+  assert.ok(routeLevel.includes("compat-null-value"), `路由级：${routeLevel.join(",")}`);
+  const modelLevel = auditCodes({ r: { baseURL: "https://x/v1", models: [{ id: "m", compat: { thinkingFormat: null } }] } });
+  assert.ok(modelLevel.includes("compat-null-value"), `模型级：${modelLevel.join(",")}`);
+});
+
+test("路由级 compat 非法键的提示引用真实报错文案（which no wire protocol declares）", () => {
+  const e = staticAudit({ r: { baseURL: "https://x/v1", compat: { nope: 1 }, models: [{ id: "m" }] } }).find((a) => a.code === "bad-route-compat-key");
+  assert.ok(e && /no wire protocol declares/.test(e.msg), e?.msg);
+});
+
 test("拼错的字段名给出「是不是想写」提示", () => {
   const e = staticAudit({ r: { baseURL: "https://x/v1", defaultInputs: ["text"], models: [{ id: "m" }] } }).find((a) => a.code === "unknown-route-key");
   assert.ok(e && /defaultInput/.test(e.msg));

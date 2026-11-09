@@ -15,7 +15,7 @@
  *   --key-file F   从 $DSH_HOME/.credentials.yaml 读 refs.NAME（--key-env NAME 时自动尝试）
  *   --yaml         打印 cordis.patch.yml 片段
  *   --json         打印 JSON
- *   --no-window    跳过窗口探测（窗口探测会发几十万 token 的输入，可能花钱）
+ *   --no-window    显式关闭窗口探测（默认就是关的；探测会发几十万 token 的输入，可能花钱）
  *   --out DIR      把本次所有响应存到 DIR（默认不存）
  *
  * 探测内容（每项都标注了成本）：
@@ -25,7 +25,8 @@
  *   4. 思考开关（off 三种写法 / on 三种写法） 每次 ~30 token
  *   5. 视觉 1×1 PNG                ~20 token
  *   6. 流式 SSE 是否带 reasoning 增量  ~30 token
- *   7. 窗口：二分探测                ⚠ 每次几十万 token 输入，默认关闭
+ *   7. 窗口：固定阶梯抽样（1M/2M/4M/8M 字符），取最大成功那次的 prompt_tokens
+ *      ×0.95 向下取整到 4096 的倍数 —— 是「安全下界」，不是精确阈值。⚠ 默认关闭
  *
  * 退出码：0 成功；1 关键步骤失败；2 用法错误
  */
