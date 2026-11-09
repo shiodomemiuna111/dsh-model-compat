@@ -1572,17 +1572,29 @@ test("组 22：窗口探测判据 —— 只有 context-overflow 才算撞到窗
   assert.equal(classifyWindowStop({ status: 408, errText: "request timeout" }), "gateway-limit");
   // 未知错误既不算窗口也不算网关，调用方会写明「不确定」
   assert.equal(classifyWindowStop({ status: 400, errText: '{"error":"bad request"}' }), "unknown-error");
+  // v0.4.2（第五轮审计 P1-3）：DashScope / Qwen 的真实超限措辞
+  assert.equal(classifyWindowStop({ status: 400, errText: '{"code":"invalid_parameter_error","message":"Range of input length should be [1, 131072]."}' }), "context-overflow");
+  assert.equal(classifyWindowStop({ status: 400, errText: "Your request exceeded model token limit: 262144 (requested: 300000)" }), "context-overflow");
+  // v0.4.2（P2-1）：带「maximum」「429」的限流/体积文本不能被当成模型窗口
+  assert.equal(classifyWindowStop({ status: 429, errText: "Request exceeds the maximum number of requests per minute" }), "gateway-limit");
+  assert.equal(classifyWindowStop({ status: 413, errText: "Input exceeds the maximum allowed payload size of 10485760 bytes" }), "gateway-limit");
+  assert.equal(classifyWindowStop({ status: 400, errText: "max_tokens exceeds the maximum allowed value" }), "unknown-error");
 });
 
-test("组 22：档位判据 —— 采样噪声（15 vs 28）不能判「支持档位」，2 倍以上才认", async () => {
+test("组 22/24：档位判据 —— 相对判据（≥1.5 倍且差 ≥ max(8,10%)）", async () => {
   const { effortProven, median, reasoningTokensOf } = await import("../lib/probe-heuristics.mjs");
-  // 噪声：同一档两次都差不多，另一档只高一丁点 → 不认
-  assert.equal(effortProven([14, 16], [26, 30]), false);
-  // 真实差异：high 明显拉长（≥2 倍且 ≥16）→ 认
+  // 采样噪声：两档几乎一样（20 vs 22.5）→ 不认
+  assert.equal(effortProven([18, 22], [20, 25]), false);
+  // 真差异 1.87 倍（15 → 28）：新判据认（旧判据要求 2 倍，实测漏判率 41%，见第五轮审计 P2-2）
+  assert.equal(effortProven([14, 16], [26, 30]), true);
+  // 明显差异
   assert.equal(effortProven([12, 14], [180, 210]), true);
-  // 边界：刚好 16 且 2 倍
-  assert.equal(effortProven([16, 16], [32, 32]), true);
+  // 边界：刚好 1.5 倍且差 8
+  assert.equal(effortProven([16, 16], [24, 24]), true);
+  // 大基线但倍数不够（2000 → 2400 是 1.2 倍）→ 不认
+  assert.equal(effortProven([2000, 2100], [2400, 2500]), false);
   assert.equal(median([3, 9, 5]), 5);
+  assert.equal(median([14, 16]), 15);
   // 多信号计数：usage、reasoning_content、布尔都要能认出来
   assert.equal(reasoningTokensOf({ usage: { completion_tokens_details: { reasoning_tokens: 42 } } }), 42);
   assert.equal(reasoningTokensOf({ choices: [{ message: { reasoning_content: "1234567890" } }] }), 10);
@@ -1630,7 +1642,7 @@ test("组 22：verify-effective —— 超限报错 + 输入远小于声明窗�
   assert.equal(r.status, 1);
   const out = JSON.parse(r.stdout);
   const issues = out.problems[0].issues.join(" | ");
-  assert.match(issues, /实际窗口 < 声明的 1000000/, issues);
+  assert.match(issues, /服务端自报窗口 131072 < 声明的 1000000/, issues);
 });
 
 test("组 22：verify-effective —— 挂起的图不会串到换模型后的另一个模型（评审 1c）", async () => {
@@ -1745,4 +1757,126 @@ test("verify-effective：用过但配置里已没有的模型要单独列出（�
   assert.equal(orphan.model, "ghost");
   assert.equal(orphan.verdict, "配置里已没有这个模型");
   assert.match(orphan.warnings.join(" "), /当前补丁里没有任何路由声明它/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 24：第五轮审计（v0.4.2）—— 探针不得凭空声明思考、BOM 能修、中文超限不静默
+// ═══════════════════════════════════════════════════════════════════════
+/** 一个「什么都不认」的网关：不看 reasoning_effort / enable_thinking，永远返回 0 推理。 */
+async function startPlainGateway() {
+  const { createServer } = await import("node:http");
+  const srv = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const j = body ? JSON.parse(body) : {};
+      const send = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+      if (req.url.endsWith("/models")) return send(200, { data: [{ id: "plain-1" }] });
+      if (!req.url.endsWith("/chat/completions")) return send(404, { error: { message: "no route" } });
+      if (j.max_tokens > 8192) return send(400, { error: { message: "too large" } });
+      const hasImage = JSON.stringify(j.messages ?? []).includes("image_url");
+      send(200, {
+        choices: [{ message: { content: hasImage ? "red" : "1+1=2" } }],
+        usage: { prompt_tokens: 20, completion_tokens: 2 },
+      });
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { base: `http://127.0.0.1:${srv.address().port}/v1`, close: () => srv.close() };
+}
+
+test("组 24：探针证明「开不了思考」时，片段不许写 reasoningEfforts（P0-1）", async () => {
+  const gw = await startPlainGateway();
+  try {
+    const r = await runNode([
+      new URL("../scripts/probe-capabilities.mjs", import.meta.url).pathname,
+      "--base", gw.base, "--model", "plain-1", "--key", "k", "--json",
+    ]);
+    assert.equal(r.code, 0, r.stderr);
+    const d = JSON.parse(r.stdout);
+    assert.deepEqual(d.summary.thinkingSwitchable, [], "这个网关不该有任何能生效的思考开关");
+    assert.equal(d.summary.thinkingCanDisable, false, "开都开不起来，就不该说「可关」");
+    assert.equal(/reasoningEfforts:\s*\{/.test(d.yaml), false, `不许写 reasoningEfforts 对象：\n${d.yaml}`);
+    assert.match(d.yaml, /reasoningEfforts: false/, d.yaml);
+    assert.equal(/thinkingFormat:/.test(d.yaml), false, `没有格式证据也不许写 compat：\n${d.yaml}`);
+  } finally { gw.close(); }
+});
+
+test("组 24：effort 采样噪声（网关按调用顺序变长）不能被判成「支持档位」（P1-3）", async () => {
+  const { createServer } = await import("node:http");
+  const seq = [20, 25, 30, 35, 40, 45]; // 与 reasoning_effort 无关，只是越来越长
+  let i = 0;
+  const srv = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const j = body ? JSON.parse(body) : {};
+      const send = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+      if (req.url.endsWith("/models")) return send(200, { data: [{ id: "noise-1" }] });
+      if (!req.url.endsWith("/chat/completions")) return send(404, { error: { message: "no route" } });
+      if (j.max_tokens > 8192) return send(400, { error: { message: "too large" } });
+      const n = seq[Math.min(i++, seq.length - 1)];
+      send(200, {
+        choices: [{ message: { content: "1+1=2", reasoning_content: "x".repeat(n) } }],
+        usage: { prompt_tokens: 20, completion_tokens: 2, completion_tokens_details: { reasoning_tokens: n } },
+      });
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}/v1`;
+  try {
+    const r = await runNode([
+      new URL("../scripts/probe-capabilities.mjs", import.meta.url).pathname,
+      "--base", base, "--model", "noise-1", "--key", "k", "--json",
+    ]);
+    assert.equal(r.code, 0, r.stderr);
+    const d = JSON.parse(r.stdout);
+    assert.equal(d.summary.thinkingSupportsEffort, false, `顺序噪声不该被判成档位差异：${JSON.stringify(d.summary)}`);
+  } finally { srv.close(); }
+});
+
+test("组 24：BOM 补丁能被 repair --apply 修（不再误报并发写）（P1-1）", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "bom.yml");
+  const body = `- id: llm-pi-ai\n  config:\n    providers:\n      custom-127-0-0-1-19431:\n        api: openai-completions\n        baseURL: ${PROBE_FIXTURE.base}\n        models:\n          - id: probe-m\n            contextWindow: 1000000\n            maxTokens: 128000\n            input: [text]\n`;
+  writeFileSync(patch, "\ufeff" + body);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify(PROBE_FIXTURE));
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 0, `BOM 文件应当能修：${r.stderr.slice(0, 500)}`);
+  const after = readFileSync(patch, "utf8");
+  assert.match(after.replace(/^\ufeff/, ""), /contextWindow: 131072/, "应当真的改了窗口");
+});
+
+test("组 24：--all-models 不带 --route 直接拒绝（P3-1 影响半径）", async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      p:\n        api: openai-completions\n        baseURL: https://p.invalid/v1\n        models:\n          - id: m\n            contextWindow: 131072\n`);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify({ base: "https://p.invalid/v1", model: "m", summary: {} }));
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--all-models", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /--all-models 必须同时给 --route/);
+});
+
+test("组 24：认不出的失败（中文超限）不再静默丢弃（P2-2）", async () => {
+  const { zstdCompressSync } = await import("node:zlib");
+  const { mkdirSync } = await import("node:fs");
+  const d = tmp();
+  const sessions = join(d, "sessions");
+  const sdir = join(sessions, "--root-workspace--", "session-zh");
+  mkdirSync(sdir, { recursive: true });
+  const events = [
+    { type: "request/context", data: { provider: "p", model: "m", contextWindow: 1000000 } },
+    { type: "assistant/message", data: { usage: { inputTokens: 5000 }, content: [{ type: "text", text: "ok" }] } },
+    { type: "assistant/attempt", data: { stream: [{ chunk: { reason: { kind: "error", failure: { message: "输入过长：超过模型允许的最大上下文，请缩短输入" } } } }] } },
+  ];
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      p:\n        api: openai-completions\n        baseURL: https://p.invalid/v1\n        models:\n          - id: m\n            contextWindow: 1000000\n            maxTokens: 65536\n            input: [text]\n`);
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", sessions, "--json", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr.slice(0, 300));
+  const out = JSON.parse(r.stdout);
+  const all = JSON.stringify(out);
+  assert.match(all, /输入过长/, `中文超限原文必须出现在输出里（不能 false green）：${all.slice(0, 800)}`);
 });

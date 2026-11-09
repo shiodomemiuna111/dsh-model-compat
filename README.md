@@ -13,6 +13,13 @@
 3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效；
 4. **上线后对账 + 自动修正**——从真实会话记录里查「声明 vs 实际」，按探针结果重算并安全改写，全程留 JSONL 日志（含「上次为什么失败」）。
 
+> **v0.4.2**（第五轮三份审计后的修复）：三名审计员（对抗破坏 / 照文档敲 / 机制核验）在 v0.4.1 上报了 **1 个 P0 + 6 个 P1 + 10 个 P2/P3**，全部成立并已修：
+> - **P0**：探针自己证明「开不了思考」，`--yaml` 片段却仍写 `reasoningEfforts {off, high}`——`resolve-check` 全绿、DSH 能加载，但 pi-ai 实发 `reasoning_effort`，strict 网关**每次请求 400**。根因是默认关时 `canDisable` 恒为 true；现在默认关必须证明「开得起来」才算可关，无开关证据就写 `reasoningEfforts: false`。组 24 用 plain mock 锁死。
+> - **P1**：①BOM 补丁永远报「被另一个进程改过」——指纹改用原始字节；②429 TPM 的 `too many tokens` 被当成窗口铁证——先排除限流，铁证只认**错误文本里服务端自报的窗口**；③窗口分类按 pi-ai `overflow.js` 的 27 条重写（DashScope `Range of input length…` 等 11 条此前漏判）；④档位判据改**每档 3 次交错采样 + 区间分离**（`min(high) ≥ max(low)×1.5`），无因果网关误判从 ~10.8% 降下来；⑤中文超限原文不再被静默丢弃。
+> - **P2/P3**：孤儿模型不再把 `models: []`（目录模型）和 `modelOverrides` 误报；`--all-models` 强制配 `--route`。
+>
+> 测试 102 → **107 条（24 组，0 skip）**。
+
 > **v0.4.1**：补一个盲点——`verify-effective` 之前只遍历「补丁里声明了的模型」，于是**会话里真跑过、但当前补丁里已不存在**的 provider/model 被静默跳过（改过路由名 / 删了条目 / 被别的层覆盖，对账都会显示「没有发现不一致」）。现在这类模型单列一行，判 `配置里已没有这个模型` 并给出「用过 N 轮」的证据。属 warning（exit 0），因为「确实删了模型」是合法操作。测试 101 → **102 条（23 组，0 skip）**。
 
 > **v0.4.0**（第四轮外部评审的核验与修复）：评审提了 4 个逻辑漏洞 + 4 处文档矛盾，逐条核验后 **3 条成立、1 条部分成立、1 条不成立（已实测反驳）**：
@@ -28,7 +35,7 @@
 
 > **v0.3.9**（第三轮三个子代理审计后的修复）：①**P0**——compaction 配置不符合插件加载规则时，所有工具仍打 ✓ 连 `--apply` 也写进去，现在新增 `validateCompactionConfig()` 在 7 个入口先拒、一个字节不写；②`repair` 多路由只真改一条却报「已修正 3 个模型」（stale 行数组），现在同数组降序替换并断言行数；③`repair` 对 BOM 文件恒判「被并发修改」、空 probe 时凭空写 `maxTokens`、`--route` 把同路由别的模型一起改——都已修；④写盘改成「先整份预验、再原子写」，思考声明统一走 `thinkingFromProbe()`；⑤`verify-effective` 按时间升序、图片归属修正；⑥context-budget 非整数参数 exit 2、gap 只警告。测试 87 → **95 条（21 组，0 skip）**。
 >
-> **v0.3.8**（三个子代理对 v0.3.7 的对抗审计后的修复）：①`repair --apply` 的数据丢失级 P0——块尾扫描把 providers 下**兄弟路由**也算进被修块，静默删光后续路由还报成功（现用 `findRouteBlock` 按缩进判定，审计给的 `target/keep1/keep2` 场景已复现保留）；②`merge-routes` 逐条隔离校验时用的永远是默认 compaction 配置（`--no-verify` 能写出 DSH 启动必拒的配置），现在写前一定跑整份预算校验；③`probe` 把「HTTP 200 + 错误 JSON」当成功、视觉把否定句当答对，改为必须 `choices` 非空且必须答出 red；④`verify-effective` 全坏会话时假绿、`--no-log` 仍写日志、用历史会话旧 ctx 判矛盾；⑤`compaction` 区分**硬失败**（DSH 真会抛）与**工程警告**（`gap<30000`），保留量优先级照插件 `resolveTargetPolicy`；⑥思考声明显式写 `supportsReasoningEffort: false`（不写=默认 true，实测仍会发 `reasoning_effort`），并修掉 4 条 wire 测试「永远 ✔ 但一行没跑」的空跑；⑦8 个脚本 `--help` 统一到 `lib/usage.mjs`，测试组 19 做双向对账。测试 82 → **95 条（21 组，0 skip）**。
+> **v0.3.8**（三个子代理对 v0.3.7 的对抗审计后的修复）：①`repair --apply` 的数据丢失级 P0——块尾扫描把 providers 下**兄弟路由**也算进被修块，静默删光后续路由还报成功（现用 `findRouteBlock` 按缩进判定，审计给的 `target/keep1/keep2` 场景已复现保留）；②`merge-routes` 逐条隔离校验时用的永远是默认 compaction 配置（`--no-verify` 能写出 DSH 启动必拒的配置），现在写前一定跑整份预算校验；③`probe` 把「HTTP 200 + 错误 JSON」当成功、视觉把否定句当答对，改为必须 `choices` 非空且必须答出 red；④`verify-effective` 全坏会话时假绿、`--no-log` 仍写日志、用历史会话旧 ctx 判矛盾；⑤`compaction` 区分**硬失败**（DSH 真会抛）与**工程警告**（`gap<30000`），保留量优先级照插件 `resolveTargetPolicy`；⑥思考声明显式写 `supportsReasoningEffort: false`（不写=默认 true，实测仍会发 `reasoning_effort`），并修掉 4 条 wire 测试「永远 ✔ 但一行没跑」的空跑；⑦8 个脚本 `--help` 统一到 `lib/usage.mjs`，测试组 19 做双向对账。测试 82 → **87 条（20 组，0 skip）**。
 
 > **v0.3.7**（用户三问：有没有按键 / 怎么知道生效 / 没生效怎么自动修正并记日志）：新增两个脚本 `verify-effective.mjs`（读 `$DSH_HOME/sessions/**/session.v4.jsonl.zstd`，比对运行时 `contextWindow`、实际 inputTokens、真实发图、失败类别）与 `repair.mjs`（默认 dry-run 出 diff，`--apply` 才写：三段校验 → 备份 → 原子写 → 写后复验 → 失败回滚）；新增 `lib/runlog.mjs`（JSONL，下一次尝试自动带出上一次失败原因）；`lib/snippet.mjs` 抽出 `thinkingDecl`，probe / snippet / repair 共用一套「思考怎么声明」规则。测试 77 → **82 条**（组 16/17/18）。
 

@@ -120,6 +120,9 @@ async function main() {
   const probeBase = probe?.base;
   const probeModel = probe?.model;
   if (!probeBase || !probeModel) { console.error("探测结果缺 base/model（不要手写，用 probe-capabilities --json）"); process.exit(2); }
+  // v0.4.2（第五轮审计 P3-1）：--all-models 的影响半径是「所有 endpoint 匹配的路由」，
+  // 裸用会一次改掉很多模型。强制同时给 --route，避免误伤。
+  if (o.allModels && !o.route) { console.error("--all-models 必须同时给 --route（它会把该路由下所有模型都按同一份探针重写）"); process.exit(2); }
 
   let rawText;
   try { rawText = readFileSync(o.patch, "utf8"); } catch (e) { console.error(`读不到补丁：${String(e?.message ?? e)}`); process.exit(2); }
@@ -388,7 +391,7 @@ async function main() {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
   let bak = null;
   try {
-    assertUnchanged(target, contentFingerprint(rawText));
+    assertUnchanged(target, rawFingerprint); // v0.4.2（审计 P1-1）：必须用原始字节的指纹（rawText 已剥 BOM）
     bak = backupFile(target, stamp);
     atomicWriteFile(target, outText, {
       check: (content) => {

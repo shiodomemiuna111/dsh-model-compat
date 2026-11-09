@@ -28,6 +28,7 @@ import { createRequire } from "node:module";
 import { computeBudget, compactionConfigFromPatch } from "../lib/compaction.mjs";
 import { logAttempt, appendRecord, DEFAULT_LOG } from "../lib/runlog.mjs";
 import { usageText } from "../lib/usage.mjs";
+import { isContextOverflowText, parseStatedContextLimit } from "../lib/probe-heuristics.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -226,7 +227,11 @@ const FAILURE_CLASSES = [
 ];
 
 function classifyFailure(msg) {
-  for (const c of FAILURE_CLASSES) if (c.re.test(msg)) return c;
+  // v0.4.2（第五轮审计 P3-3）：溢出判据与 pi-ai 的 overflow 正则族对齐（先排除限流/额度），
+  // 不再用「context_length|maximum context」这四五条窄正则，避免 DashScope 的
+  // `Range of input length should be [1, 131072]` 被归成 unknown。
+  if (isContextOverflowText(msg)) return FAILURE_CLASSES[0];
+  for (const c of FAILURE_CLASSES.slice(1)) if (c.re.test(msg)) return c;
   return null;
 }
 
@@ -237,8 +242,16 @@ export function reconcile({ facts, providers, compaction }) {
   // v0.4.1：会话里用过、但当前补丁里**已经没有**的 provider/model 不能静默忽略
   // （改路由名、删模型、被别的层覆盖都会落到这里）。
   const declaredKeys = new Set();
+  // v0.4.2（第五轮审计 P1-2）：`models: []` + `modelOverrides` 是合法写法 ——
+  // 插件会回落到 pi-ai 目录模型（index.js:666-670），这时无法从补丁枚举出模型名，
+  // 不能把这些 provider 的会话记录当成「孤儿模型」误报。
+  const catalogProviders = new Set();
   for (const [routeName, route] of Object.entries(providers ?? {})) {
     const models = Array.isArray(route?.models) ? route.models : [];
+    if (models.length === 0) catalogProviders.add(routeName);
+    if (route?.modelOverrides && typeof route.modelOverrides === "object") {
+      for (const id of Object.keys(route.modelOverrides)) declaredKeys.add(`${routeName}\u0000${id}`);
+    }
     for (const m of models) {
       const id = m?.id;
       if (!id) continue;
@@ -305,7 +318,14 @@ export function reconcile({ facts, providers, compaction }) {
       const byClass = new Map();
       for (const msg of row.failures) {
         const c = classifyFailure(msg);
-        if (!c) continue;
+        // v0.4.2（第五轮审计 P2-2）：认不出的失败（例如中文「输入过长：超过模型允许
+        // 的最大上下文」）过去被静默丢弃 → 工具报「没有发现不一致」，是 false green。
+        // 现在至少给一条 unknown 警告并附原文。
+        if (!c) {
+          const line = `[unknown] 认不出的失败原文（不会据此判矛盾，但可能藏着真问题）：${msg.slice(0, 200)}`;
+          if (!row.warnings.includes(line)) row.warnings.push(line);
+          continue;
+        }
         if (!byClass.has(c.id)) byClass.set(c.id, { c, n: 0, sample: msg });
         byClass.get(c.id).n += 1;
       }
@@ -313,13 +333,23 @@ export function reconcile({ facts, providers, compaction }) {
       // 「历史 ctx 提示」整段清空，只剩限流类提示 —— 是真的丢信息。
       for (const { c, n, sample } of byClass.values()) {
         let line = `[${c.id}] ${c.hint}（${n} 次）：${sample.slice(0, 160)}`;
-        // v0.4.0：这才是「网关窗口比声明小」的铁证 —— 真的超限了，而当时最大单轮输入
-        // 还没到声明的 contextWindow。
-        if (c.id === "context-overflow" && row.maxInputTokens > 0 && row.maxInputTokens < declaredCtx) {
-          line += `；最大单轮输入只有 ${row.maxInputTokens} 却报超限 → 实际窗口 < 声明的 ${declaredCtx}（这是唯一能证伪大窗口的运行时证据）`;
+        if (c.id === "context-overflow") {
+          // v0.4.2（第五轮审计 P1-1）：旧版拿「成功请求的最大输入」去比声明窗口，
+          // 而失败请求本身的 token 数并不等于它 —— 服务端自报上限是 1e6、请求 1.2M
+          // 也会被误判成「窗口比声明小」。现在只认错误文本里服务端自报的窗口数值。
+          const stated = parseStatedContextLimit(sample);
+          if (Number.isFinite(stated) && stated < declaredCtx) {
+            line += `；服务端自报窗口 ${stated} < 声明的 ${declaredCtx} → 这是「声明大于真实窗口」的铁证`;
+            row.issues.push(line);
+          } else if (Number.isFinite(stated)) {
+            row.warnings.push(`${line}；服务端自报窗口 ${stated} ≥ 声明（${declaredCtx}）—— 多半是这一轮请求本身超了，不是声明错`);
+          } else {
+            row.warnings.push(`${line}；错误文本里没有服务端自报的窗口数值，无法据此判断声明是否正确（证据不足）`);
+          }
+          continue;
         }
         // 只有「声明与实际矛盾」类才算 error；限流/鉴权是环境噪音，单列 warning。
-        if (c.id === "context-overflow" || c.id === "image-unsupported" || c.id === "thinking-rejected") row.issues.push(line);
+        if (c.id === "image-unsupported" || c.id === "thinking-rejected") row.issues.push(line);
         else row.warnings.push(line);
       }
 
@@ -331,8 +361,26 @@ export function reconcile({ facts, providers, compaction }) {
   }
   for (const [key, fact] of facts) {
     if (declaredKeys.has(key)) continue;
-    if (!(fact.requests > 0 || fact.imageMessages > 0)) continue;
     const [provider, model] = key.split("\u0000");
+    // v0.4.2（P1-2）：catalog 路由（models: []）无法从补丁枚举模型名，跳过孤儿判定；
+    // 但给一行说明，避免读者以为「全都核对过了」。
+    if (catalogProviders.has(provider)) {
+      if (!(fact.requests > 0 || fact.failures.length > 0)) continue;
+      rows.push({
+        route: provider, model, orphan: true, catalog: true,
+        declaredCtx: null, declaredMax: null, declaredImage: null,
+        runtimeCtx: [...fact.contextWindows], latestRuntimeCtx: fact.latestContextWindow ?? null,
+        requests: fact.requests, maxInputTokens: fact.maxInputTokens,
+        imageUsed: fact.imageMessages > 0, imageMessages: fact.imageMessages,
+        reasoningSeen: fact.reasoningMessages > 0, retries: fact.retries, failures: fact.failures,
+        verdict: "目录模型（未逐个核对）",
+        issues: [],
+        warnings: [`该路由 \`models: []\`，实际用的是 pi-ai 目录模型；会话里用过 ${fact.requests} 轮。本工具无法从补丁枚举目录模型，所以没做逐模型对账`],
+      });
+      continue;
+    }
+    // v0.4.2（P2-3）：只有失败、没有 assistant/message 的模型也是证据，不能静默丢。
+    if (!(fact.requests > 0 || fact.imageMessages > 0 || fact.failures.length > 0 || fact.contextWindows.size > 0)) continue;
     rows.push({
       route: provider, model,
       declaredCtx: null, declaredMax: null, declaredImage: null,
@@ -395,6 +443,7 @@ function main() {
     thresholdRatio: compactionConfig.thresholdRatio ?? 0.8,
     retainRatio: compactionConfig.retainRatio ?? 0.16,
     retainTokens: compactionConfig.retainTokens,
+    maxTokens: compactionConfig.maxTokens,
     duplicates: compactionConfig.duplicates ?? [],
   };
 

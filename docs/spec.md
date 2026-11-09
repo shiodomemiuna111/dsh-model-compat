@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.4.1 ｜ **代码提交**：`5da81c5`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.4.2 ｜ **代码提交**：`COMMIT_HASH`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -20,7 +20,27 @@
 
 ---
 
-### 0.0 本轮修订（v0.4.0）——第四轮外部评审后的修正
+### 0.0 本轮修订（v0.4.2）——第五轮三份审计后的修正
+
+第五轮把 v0.4.1（`5da81c5` → `e386583`）冻结成 `/tmp/audit-v041`，三名审计员分别做**对抗破坏**（audit-breaker）、**照文档敲 + 核数字**（audit-docs）、**机制正确性核验**（audit-fix-verify）。结论：**1 个 P0、6 个 P1、10 个 P2/P3 成立**，本轮全部处理：
+
+| 审计项 | 结论 | v0.4.2 处理 |
+|---|---|---|
+| **P0** 探针自己证明「开不了思考」，片段却仍写 `reasoningEfforts {off, high}`；strict 网关每次请求 400 | **成立**（本地 strict mock + 真 pi-ai wire 复现） | 根因是 `canDisable` 在「默认关」时恒为 true。改为「默认关时必须证明**开得起来**，off 档才有意义」；无任何开关证据 → `reasoningEfforts: false`、不写 compat。补组 24 用例锁死 |
+| **P1** `repair` 对 BOM 文件恒报「被另一个进程改过（并发写）」 | **成立**（`rawFingerprint` 是死变量） | 写前 `assertUnchanged` 改用**原始字节**指纹（`rawText` 已剥 BOM）；组 24 用真 BOM 文件跑 `--apply` |
+| **P1** verify-effective 把 429 TPM 的 `too many tokens` 当「窗口比声明小」的铁证 | **成立** | 分类改为「先排除限流/额度」，且铁证只认**错误文本里服务端自报的窗口数值**（`parseStatedContextLimit`）；自报值 ≥ 声明值 → warning（「多半是这轮请求本身超了」） |
+| **P1** 窗口失败分类漏判 DashScope/iFlytek 等 11 种真实措辞 | **成立**（真实会话 2 次被判 unknown） | `lib/probe-heuristics.mjs` 按 pi-ai `overflow.js` 的 27 条重写 `WINDOW_PATTERNS`，并加 `NON_OVERFLOW_PATTERNS` 先判；窗口探测遇 `context-overflow` 时**优先采用服务端自报上限** |
+| **P1** 档位判据对无因果网关误判 ~10.8%（每档 2 次 + 2 倍规则） | **成立**（200k 次模拟） | 每档 **3 次交错采样** + **区间分离判据**：`min(high) ≥ max(low) × 1.5` 且绝对差 ≥ max(8, 10%)；组 24 用「按调用顺序变长」的假网关验证不误判 |
+| **P1/P2** 中文超限原文被静默丢弃 → 报「没有发现不一致」（false green） | **成立** | 补中文超限正则；**认不出的失败**一律作为 `[unknown]` warning 并附原文，不再吞掉 |
+| **P2** 孤儿模型误报：合法 `models: []`（回落目录模型）与 `modelOverrides` 被当成孤儿 | **成立** | 目录模型单列「目录模型（未逐个核对）」不判孤儿；`modelOverrides` 的键计入已声明集合 |
+| **P3** `--all-models` 文档说「配合 --route」，实际裸用扫掉所有匹配路由的模型 | **成立** | 强制要求同时给 `--route`（否则 exit 2）；`--help` 同步 |
+| §4.4 真实 profile 输出格式与计数（101/22、`请求=2444`）过时 | **成立** | 全部换成 2026-11-09 实测输出（107 条 / 24 组、`请求=2832`、及其 1 条静态审计警告） |
+
+一句话：**第五轮没有推翻方案的机制假设，推翻的是「工具在边界输入上很诚实」这个印象**——P0 属于「工具说全绿，运行必 400」。测试 102 → **107 条（24 组，0 skip）**。
+
+---
+
+### 0.0a 上一轮修订（v0.4.0）——第四轮外部评审后的修正
 
 第四轮评审提出「4 个逻辑漏洞 + 4 处文档自相矛盾」。逐条核验结果：
 
@@ -33,7 +53,7 @@
 | ⑤`repair --apply` 重渲染会抹掉 headers / retryPolicy / timeoutMs / thinkingBudgets | **不成立**（`renderRouteYaml` 是对整个路由对象做 YAML.stringify，未知字段天然保留） | 实测复现：`headers/retryPolicy/timeoutMs/thinkingBudgets/transport/displayName` 全部原样保留；已补组 22 回归测试锁死这个行为 |
 | ⑥窗口探测把 413/429/超时当成窗口边界 | **成立** | 抽出 `lib/probe-heuristics.mjs::classifyWindowStop`：只有 `context-overflow` 才算撞墙；`gateway-limit` 只报「网关限制，无法判定窗口」，并给出「至少这么大」的下界说明 |
 
-文档侧同时改掉 4 处自相矛盾：§2.4 的 `headroomTokens` 硬失败表述、§2.7/§3.5 残留的「必须能把 reasoning 归零」旧文案、§3.5 建议 `defaultMaxTokens: 65536`、附录 B 的 probe/repair 退出码。测试 95 → 101 条（22 组）→ **102 条（23 组）**。
+文档侧同时改掉 4 处自相矛盾：§2.4 的 `headroomTokens` 硬失败表述、§2.7/§3.5 残留的「必须能把 reasoning 归零」旧文案、§3.5 建议 `defaultMaxTokens: 65536`、附录 B 的 probe/repair 退出码。测试 95 → 101 条（22 组）→ 102 条（23 组）→ **107 条（24 组，v0.4.2）**。
 
 ---
 
@@ -88,7 +108,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 8 个零依赖脚本 + 10 个共享库 + 一份可直接抄的声明模板 + 102 条回归测试（含 4 条真实 wire 断言，不再有「跳过也变绿」的空跑用例）。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 8 个零依赖脚本 + 10 个共享库 + 一份可直接抄的声明模板 + 107 条回归测试（含 4 条真实 wire 断言，不再有「跳过也变绿」的空跑用例）。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -189,7 +209,7 @@ function declaredInput(configured) {
 
 ```js
 // :124-134 resolveCompactSpec
-B         = contextWindow - reservedCompletionTokens   // :757: maxTokens ?? defaultMaxTokens ?? 0
+B         = contextWindow - reservedCompletionTokens   // :758: maxTokens ?? defaultMaxTokens ?? 0
 pressure  = B - headroomTokens                          // :63 默认 65536
 threshold = floor(min(contextWindow * 0.8, pressure))   // :15 = .8, :132
 retain    = floor(B * 0.16)                             // :17 = .16, :133
@@ -386,7 +406,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 
 > v0.3.0 修的三处判据漏洞：旧版「输出上限」只发一次 `max_tokens=400000`（多数网关直接 400，测出来的是「不支持 400k」而不是上限）；旧版视觉判据 `200 && (有回答 || prompt_tokens>20)` 里「有回答」恒真（静默丢图的网关全放行）；旧版思考只测「怎么关」（默认关闭的模型会被误判成不可调）。
 
-### 3.4 九个共享库
+### 3.4 十个共享库
 
 | 库 | 导出 | 职责 |
 |---|---|---|
@@ -397,7 +417,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | `lib/fs-safe.mjs` | `resolveWriteTarget` `atomicWriteFile` `backupFile` `rollbackFrom` `contentFingerprint` `assertUnchanged` | realpath 跟随软链、同目录临时文件 + 校验 + `rename` 原子替换、带时间戳备份与回滚 |
 | `lib/yaml-edit.mjs` | `locateProviders` `findRouteBlock` `removeRouteBlock` `renderRouteYaml` `renderManagedBlock` `findManagedBlock` `detectEol` `normalizeEol` `applyEol` | 保留注释与格式地增删 providers 条目；缩进从目标文件探测 |
 | `lib/snippet.mjs` | `buildSnippet(...) → {yaml, chosenMaxTokens, budget, notes}`、`thinkingDecl(t)`、`thinkingFromProbe(probe)` → `{compat, efforts, notes}` | 证据 → YAML 片段的唯一出口；`maxTokens` 由 `pickSafeMaxTokens` 反推，不再硬编码 65536；v0.3.6 把「思考怎么声明」抽成 `thinkingDecl`，probe / snippet / repair 三处共用，避免规则漂移 |
-| `lib/probe-heuristics.mjs` | `classifyWindowStop` `effortProven` `median` `reasoningTokensOf` | 探测判据的纯函数（v0.4.0）：窗口失败分类（超限 vs 网关限制）、档位差异显著性（2 倍 + 16 token）、多信号思考计数。抽出来的理由是「判据要能单测，而不是只能真发 8MB 请求去验」 |
+| `lib/probe-heuristics.mjs` | `classifyWindowStop` `isContextOverflowText` `parseStatedContextLimit` `effortProven` `median` `reasoningTokensOf` | 探测判据的纯函数：窗口失败分类（超限 vs 网关限制，按 pi-ai `overflow.js` 的 27 条 + 限流先判）、从错误文本解析**服务端自报窗口**、档位差异显著性（v0.4.2 改**区间分离**：`min(high) ≥ max(low)×1.5` 且差 ≥ max(8,10%)）、多信号思考计数。抽出来的理由是「判据要能单测，而不是只能真发 8MB 请求去验」 |
 | `lib/usage.mjs` | `USAGE` `usageText(name)` `flagsOf(name)` | 8 个脚本 `--help` 的唯一来源；测试组 19 拿「源码里真实解析的 `--flag`」与它双向对账 |
 | `lib/runlog.mjs` | `attemptKey` `logAttempt` `logChange` `readRecords` `lastFailureFor` `describeFailure` | JSONL 运行日志：同一尝试键的**上一次失败**会被下一次记录自动带出（`prevFailureId`/`prevFailure`），回答「为什么上次没成功」 |
 
@@ -490,13 +510,13 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 
 | # | 命令 | 结果 | 时间 |
 |---|---|---|---|
-| 1 | `npm test` | **101 pass / 0 fail / 0 skip**（22 个测试组） | 2026-11-09 |
+| 1 | `npm test` | **107 pass / 0 fail / 0 skip**（24 个测试组） | 2026-11-09 |
 | 2 | `npm run selfcheck` | exit 0（测试 + 示例预算 + 示例两段校验） | 2026-11-09 |
-| 3 | `node scripts/resolve-check.mjs --patch /root/.dsh/profiles/web/cordis.patch.yml --lint --budget` | exit 0；5 条真实路由全 ✓，静态审计无问题，预算全绿（gap 444163 / 650486 / 554264 / 554264 / 522486） | 2026-11-09 |
+| 3 | `node scripts/resolve-check.mjs --patch /root/.dsh/profiles/web/cordis.patch.yml --lint --budget` | exit 0；5 条真实路由全 ✓，**静态审计 1 条警告**（`qwen-effort-may-be-ignored`：dashscope 路由声明了 `supportsReasoningEffort: true`，百炼可能静默忽略 → 属提示不是错误），预算全绿（gap 444163 / 650486 / 554264 / 554264 / 522486） | 2026-11-09 |
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 102 条测试的分组（23 组）
+### 4.2 107 条测试的分组（24 组）
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -522,6 +542,7 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 20 | 6 | **compaction 对齐真插件（v0.3.8/v0.3.9）**：policy `retainRatio` 压过全局 `retainTokens`（旧版工具绿、真插件抛）、`headroomTokens:0` 是硬失败（插件 `assertPositiveInteger`）、`thresholdRatio` 越界是硬失败、`headroomTokens:0` + 显式 `maxTokens` 合法、显式 `retainTokens` 时豁免比例比较、`gap` 不足只算 warning（`ok` 仍为 true） |
 | 22 | 6 | **第四轮外部评审（v0.4.0）**：窗口失败分类（413/429/超时 ≠ 窗口）、档位采样噪声不判支持、单轮越过阈值只警告、超限+小输入才是窗口铁证、挂起图片不串模型、repair 保留 headers/retryPolicy/thinkingBudgets 等扩展字段 |
 | 23 | 1 | **孤儿模型（v0.4.1）**：会话里真跑过、但当前补丁里已没有的 provider/model 必须单列一行（判「配置里已没有这个模型」+ warning），不能静默丢掉证据 |
+| 24 | 5 | **第五轮审计（v0.4.2）**：①探针证明开不了思考时片段不许写 `reasoningEfforts`；②effort 顺序噪声不判支持档位；③BOM 补丁能 `repair --apply`；④`--all-models` 必须配 `--route`；⑤认不出的失败（中文超限）不静默丢弃 |
 | 21 | 5 | **第三轮审计的 P0/P1 回归（v0.3.9）**：非法 compaction 配置四个工具全拒、repair 多路由全部真改、空 probe 不凭空写 `maxTokens`、`--route` 不污染同路由别的模型、旧 probe 下 repair 与 inject 的思考声明一致 |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
@@ -549,7 +570,7 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 ✓ custom-modelscope-1 / deepseek-ai/DeepSeek-V4.1-Flash-1017  ctx=1000000 max=262144 input=[text,image] reasoning=true levels=minimal/low/medium/high/xhigh/max format=deepseek
 ✓ custom-modelscope-2 / deepseek-ai/DeepSeek-V4.1-Flash-1017  （同上）
 ✓ custom-apizn / gpt-6.1-sol                       ctx=800000  max=65536  input=[text,image] reasoning=true levels=low/high
-静态审计：未发现 strict 放行的问题写法。
+! 路由 custom-dashscope-aliyuncs / deepseek-v4.1-flash-1017：qwen 系列格式声明了 supportsReasoningEffort: true，部分网关会静默忽略 reasoning_effort（warning，不影响加载）
 压缩联动（headroom=65536）：
   ✓ custom-111: threshold=541248 retain=97085 gap=444163
   ✓ custom-dashscope-aliyuncs: threshold=800000 retain=149514 gap=650486
@@ -559,11 +580,11 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 
 **关于「4 条 ctx=1000000 为什么能过 lint」**（评审 Q&A 里问的）：它们过的是**结构性检查**——三段校验只证明「按你声明的数字算，配置能被加载、压缩不会自相矛盾」，不证明 `1000000` 是这家端点的真实窗口。这四条里的 `1000000` 是**显式写死的**（不是落默认值，所以审计不会报 `default-context-window`），但它们**没有跑过 `--window` 实测**，属于【未验】。真要坐实，得对每个端点跑一次 `probe-capabilities --window`。这也是本方案「声明必须由证据支撑」的自我打脸之处：**本机这份 profile 里就有 4 条未经证据的声明**。
 
-**运行时对账（v0.3.9，**【实测】** 2026-11-09）**：`node scripts/verify-effective.mjs --patch ~/.dsh/profiles/web/cordis.patch.yml --no-log` 读本机 8 个真实会话 / 18993 条事件：
+**运行时对账（v0.3.9，**【实测】** 2026-11-09）**：`node scripts/verify-effective.mjs --patch ~/.dsh/profiles/web/cordis.patch.yml --no-log` 读本机 8 个真实会话 / 21776 条事件：
 
 ```
-✓ 没有发现声明与实际不一致（8 个会话 · 18993 条事件）
-  ✓ custom-dashscope-aliyuncs / deepseek-v4.1-flash-1017   一致（已观测）  实际 ctx=1M,131k  请求=2444  img=True  reason=True
+✓ 没有发现声明与实际不一致（8 个会话 · 21776 条事件）
+  ✓ custom-dashscope-aliyuncs / deepseek-v4.1-flash-1017   一致（已观测）  实际 ctx=1M,131k  最大输入=238k 请求=2832  发过图  有 reasoning
   · custom-modelscope-1 / …  请求=70      · custom-modelscope-2 / …  请求=97
 ```
 
@@ -630,6 +651,8 @@ v0.3.7 曾用同一段数据判出「声明 1e6、运行时 131072 → 矛盾 ex
 18. **工具与插件的判定有一处刻意的差异**：`gap < 30000` 是工具的工程建议，不是插件规则（见 §2.4）。如果你只想「能加载」，可以用 `--min-gap 0` 放宽。
 
 ---
+19. **档位判据仍然是启发式**（v0.4.2）：`min(high) ≥ max(low)×1.5` + 每档 3 次，能把「按调用顺序变长」的假网关挡掉，但不能证明「网关真的按 effort 调预算」——最硬的证据仍是跑一次真任务，比较同一 prompt 在 low/high 下的实际耗时与 token。判据只在「有证据支持」时才写 `supportsReasoningEffort: true`，没证据就单档。
+20. **`verify-effective` 的「铁证」依赖错误文本里的自报窗口**（v0.4.2）：只有服务端在超限错误里写清 `maximum context length is N` / `Range of input length should be [1, N]` 这类措辞时，才能判「声明 > 真实窗口」；措辞不认识就只给 warning（并打印原文），不冒充铁证。
 
 ## 6. 复现步骤
 
@@ -637,7 +660,7 @@ v0.3.7 曾用同一段数据判出「声明 1e6、运行时 131072 → 矛盾 ex
 
 ```bash
 git clone https://github.com/shiodomemiuna111/dsh-model-compat && cd dsh-model-compat
-npm test                                   # 102 条回归（23 组）
+npm test                                   # 107 条回归（24 组）
 npm run selfcheck                          # 测试 + 示例配置两段校验 + 预算
 node scripts/context-budget.mjs --ctx 131072 --max 128000   # 看「为什么会失败」
 ```
@@ -689,7 +712,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 4. **§3.5 的保守取值（`maxTokens` 32768~65536、`contextWindow` 填实测值）** 在大窗口（≥1M）模型上是否会带来不可接受的提前压缩？有没有更优的 headroom/thresholdRatio 组合？
 5. **§3.6 的「没证据就不写 compat」是否过于保守？** 有没有「不写 compat 就一定错」的协议（例如某些网关必须显式 `enable_thinking` 才开思考）？
 6. **§3.7 的写盘纪律** 还有哪些破坏场景没覆盖？（我已知：SIGKILL 残留、`--replace` 注释残留、并发两个进程同时写同一文件未加锁。）
-7. **§4 的证据强度**：102 条测试（其中 4 条真跑 pi-ai 序列化）+ 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
+7. **§4 的证据强度**：107 条测试（其中 4 条真跑 pi-ai 序列化）+ 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
 8. **§5 的边界**里，哪一条在你看来是「必须修才能交付」，哪一条可以接受为已知限制？
 
 ---

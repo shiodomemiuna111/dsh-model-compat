@@ -31,7 +31,7 @@
  * 退出码：0 成功；1 关键步骤失败；2 用法错误
  */
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { classifyWindowStop, effortProven as effortProvenByData, median, reasoningTokensOf } from "../lib/probe-heuristics.mjs";
+import { classifyWindowStop, effortProven as effortProvenByData, median, parseStatedContextLimit, reasoningTokensOf } from "../lib/probe-heuristics.mjs";
 import { buildSnippet } from "../lib/snippet.mjs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -241,7 +241,10 @@ async function main() {
   const onWorks = !defaultOn
     ? Object.entries(onResults).filter(([, v]) => v.status === 200 && v.reasoning > 0).map(([k]) => k)
     : [];
-  const canDisable = defaultOn ? offWorks.length > 0 : true;
+  // v0.4.2（第五轮审计 P0-1）：默认关时旧写法恒为 true，于是「连开都开不起来」的模型
+  // 也会被当成「可关可开」，片段写出 reasoningEfforts{off,high} —— 严格网关每次 400。
+  // 默认关时只有**证明能开**，off 档才有意义（关=默认状态）。
+  const canDisable = defaultOn ? offWorks.length > 0 : onWorks.length > 0;
   const canEnable = defaultOn ? true : onWorks.length > 0;
   const switchable = defaultOn ? offWorks : onWorks;
   step("thinking-baseline", "~30 token", baseline.status, `默认 ${defaultOn ? "开" : "关"}（reasoning=${baselineReasoning}）`);
@@ -280,9 +283,10 @@ async function main() {
     const rr = await chat({ ...baseExtra, reasoning_effort: level }, question);
     return { status: rr.status, reasoning: reasoningOf(rr.json) };
   };
+  // v0.4.2（P1-3）：每档 3 次、交错采样（避免「按调用顺序变长」的网关被当成档位差异）
   const lows = [], highs = [];
   if (!o.noEffortLevels) {
-    for (let i = 0; i < 2; i++) { lows.push(await sampleEffort("low")); highs.push(await sampleEffort("high")); }
+    for (let i = 0; i < 3; i++) { lows.push(await sampleEffort("low")); highs.push(await sampleEffort("high")); }
   }
   const lo = median(lows.map((x) => x.reasoning));
   const hi = median(highs.map((x) => x.reasoning));
@@ -359,7 +363,7 @@ async function main() {
   if (o.window) {
     const unit = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ";
     const mk = (n) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
-    let lastOk = null, hi = null, stopReason = null;
+    let lastOk = null, hi = null, stopReason = null, lastErrText = null;
     for (const chars of [1000000, 2000000, 4000000, 8000000]) {
       const rr = await chat({ max_tokens: 16 }, [{ role: "user", content: `Count words: ${mk(chars)}` }]);
       if (rr.status === 200) { lastOk = rr.json?.usage?.prompt_tokens ?? lastOk; continue; }
@@ -368,11 +372,19 @@ async function main() {
       // client_max_body_size 拦成 413、或撞 TPM 限流 429 / 超时。
       // 这些**不是**模型上下文上限，不能当成「窗口边界」。
       hi = chars;
-      stopReason = classifyWindowStop({ status: rr.status, errText });
+      lastErrText = `${errText} ${rr.text ?? ""}`;
+      stopReason = classifyWindowStop({ status: rr.status, errText: lastErrText });
       step("window-probe", "⚠ 大输入", rr.status, `chars=${chars} → ${stopReason}：${errText.slice(0, 160)}`);
       break;
     }
-    if (lastOk) {
+    // v0.4.2（第五轮审计 P1-3）：超限错误里若服务端自报了上限（如 DashScope 的
+    // `Range of input length should be [1, 131072]`），那是权威值，优先于「最后一次成功 × 0.95」——
+    // 否则会为了凑下界把窗口写成 200000 占位，反而大于真实窗口。
+    const stated = stopReason === "context-overflow" ? parseStatedContextLimit(lastErrText ?? "") : null;
+    if (Number.isFinite(stated)) {
+      contextWindow = stated;
+      windowNote = `窗口取服务端在超限错误里自报的上限 ${stated}`;
+    } else if (lastOk) {
       contextWindow = Math.floor((lastOk * 0.95) / 4096) * 4096;
       if (stopReason && stopReason !== "context-overflow") {
         windowNote = `窗口只测到「至少 ${contextWindow}」（${lastOk} prompt tokens）：最后一次失败是 ${stopReason}，不是上下文超限，不能据此认定窗口就这么小；要更准请换更小的字符阶梯或直接用官方文档值`;
