@@ -26,7 +26,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { pickSafeMaxTokens, compactionConfigFromPatch } from "../lib/compaction.mjs";
-import { thinkingDecl } from "../lib/snippet.mjs";
+import { thinkingFromProbe } from "../lib/snippet.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
 import { resolveWriteTarget, backupFile, atomicWriteFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
 import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normalizeEol, applyEol, findRouteBlock } from "../lib/yaml-edit.mjs";
@@ -56,6 +56,7 @@ function parseArgs(argv) {
     else if (a === "--log") o.log = argv[++i];
     else if (a === "--no-log") o.log = null;
     else if (a === "--apply") o.apply = true;
+  else if (a === "--all-models") o.allModels = true;
     else if (a === "--dry-run") o.apply = false;
     else if (a === "--json") o.json = true;
     else if (a === "-h" || a === "--help") o.help = true;
@@ -122,6 +123,9 @@ async function main() {
 
   let rawText;
   try { rawText = readFileSync(o.patch, "utf8"); } catch (e) { console.error(`读不到补丁：${String(e?.message ?? e)}`); process.exit(2); }
+  // v0.3.9（审计 v0.3.8 P1-2）：指纹必须对**原始字节**算。旧版先剥 BOM 再算指纹，
+  // 与磁盘内容（含 BOM）不一致 → 被误判成「被另一个进程改过（并发写）」，BOM 文件根本修不了。
+  const rawFingerprint = contentFingerprint(rawText);
   const eol = detectEol(rawText);
   if (rawText.charCodeAt(0) === 0xfeff) { rawText = rawText.slice(1); console.error("提示：文件开头有 BOM，已按无 BOM 处理。"); }
   const text = normalizeEol(rawText);
@@ -135,6 +139,12 @@ async function main() {
   if (!providers || typeof providers !== "object") { console.error("补丁里没有 llm-pi-ai / providers:"); process.exit(2); }
 
   const compaction = compactionConfigFromPatch(doc);
+  // v0.3.9（审计 v0.3.8 P0-1）：插件加载期就会拒的配置，repair 必须先拒，别在坏配置上算修正。
+  if (compaction.validation && !compaction.validation.ok) {
+    console.error(`补丁里的 dsh-compaction-basic 配置在 DSH 加载期就会被拒（未改动文件）：`);
+    for (const f of compaction.validation.failures) console.error("  ✗ " + f);
+    process.exit(1);
+  }
   const headroomTokens = compaction.headroomTokens ?? 65536;
   const policies = Object.fromEntries((compaction.modelPolicies ?? []).map((p) => [String(p?.model ?? ""), p]));
 
@@ -148,7 +158,9 @@ async function main() {
     const models = Array.isArray(route.models) ? route.models : [];
     models.forEach((m, idx) => {
       if (!m || typeof m !== "object") return;
-      if (!o.routes.length && m.id !== probeModel) return;
+      // v0.3.9（审计 v0.3.8 P1-4）：--route 只是「限定路由」，绝不能把该路由下别的模型
+      // 也按同一个探针结果改写（实测 second-m 被替成 probe-m 的测量值且无警告）。
+      if (m.id !== probeModel && !o.allModels) return;
       targets.push({ routeName, route, model: m, idx });
     });
   }
@@ -179,10 +191,29 @@ async function main() {
     // 按 min(gate, ctx×0.2) 反推；没测到就「只能降不能升」，绝不拿「没测到」当「没上限」。
     const measuredGate = Number.isFinite(summary.gateMaxTokens) ? summary.gateMaxTokens
       : (Number.isFinite(summary.outputCap) ? summary.outputCap : null);
-    const pick = pickSafeMaxTokens({ contextWindow: ctx, gateMax: measuredGate, headroomTokens: localHeadroom });
+    // v0.3.9（第二轮审计 5）：反推必须带上完整 policy，否则「只传 headroom」会在
+    // policy 里改了 thresholdRatio / retainTokens 时算出与写前校验不同的值
+    // （实测 policy{thresholdRatio:.3, retainTokens:100000} 时正确结果是 null，
+    //  只传 headroom 却给出 16384，再被写前校验否掉）。
+    const pick = pickSafeMaxTokens({
+      contextWindow: ctx,
+      gateMax: measuredGate,
+      headroomTokens: localHeadroom,
+      thresholdRatio: Number.isFinite(policy.thresholdRatio) ? policy.thresholdRatio : compaction.thresholdRatio,
+      retainRatio: Number.isFinite(policy.retainRatio) ? policy.retainRatio : compaction.retainRatio,
+      retainTokens: Number.isFinite(policy.retainTokens) ? policy.retainTokens : compaction.retainTokens,
+      configMaxTokens: compaction.maxTokens,
+    });
     if (measuredGate === null && pick.maxTokens !== null) {
-      const cur = Number.isFinite(m.maxTokens) ? m.maxTokens : pick.maxTokens;
-      if (pick.maxTokens > cur) {
+      // v0.3.9（审计 v0.3.8 P1-3）：模型原本没有 maxTokens、探针又没测到上限时，
+      // 旧版拿 pick 当 cur，钳制永不触发，凭空写出 maxTokens: 32768。
+      // 正确做法：没证据就不加这个字段（只允许把已有的值往下调）。
+      if (!Number.isFinite(m.maxTokens)) {
+        pick.noEvidenceNoField = true;
+        pick.reason = "没测到网关输出上限（probe 里没有 gateMaxTokens），且模型原本没写 maxTokens：不新增该字段";
+      }
+      const cur = Number.isFinite(m.maxTokens) ? m.maxTokens : 0;
+      if (!pick.noEvidenceNoField && pick.maxTokens > cur) {
         // 没有上限证据：保持现状（只能降），并在提示里说明为什么没照「ctx×0.2」调大
         pick.maxTokens = cur;
         pick.reason = `没测到网关输出上限（probe 里没有 gateMaxTokens），不向上调整 maxTokens，保持 ${cur}`;
@@ -204,19 +235,13 @@ async function main() {
         return cur;
       })(),
     };
-    const switchableKnownEmpty = Array.isArray(summary.thinkingSwitchable) && summary.thinkingSwitchable.length === 0;
-    const decl = switchableKnownEmpty ? { compat: null, efforts: false, notes: ["探针明确「开不了思考」（thinkingSwitchable=[]）：不写 compat/reasoningEfforts"] } : thinkingDecl({
-      format: summary.switchFormat ?? null,
-      defaultOn: summary.thinkingDefaultOn === true,
-      canDisable: summary.thinkingCanDisable === true,
-      canEnable: summary.thinkingCanEnable === true,
-      supportsEffort: summary.thinkingSupportsEffort === true,
-      levels: summary.thinkingCanEnable && summary.thinkingCanDisable ? ["low", "high"] : ["high"],
-    });
+    // v0.3.9（P2-4）：与 inject 共用 lib/snippet.mjs 的 thinkingFromProbe，
+    // 同一份 probe（含旧版缺 thinkingSwitchable 的）在两边必须给出相同声明。
+    const decl = thinkingFromProbe(summary);
 
     const diffs = [];
     if (m.contextWindow !== want.contextWindow) diffs.push({ field: "contextWindow", from: m.contextWindow, to: want.contextWindow });
-    if (m.maxTokens !== want.maxTokens) diffs.push({ field: "maxTokens", from: m.maxTokens, to: want.maxTokens });
+    if (!pick.noEvidenceNoField && m.maxTokens !== want.maxTokens) diffs.push({ field: "maxTokens", from: m.maxTokens, to: want.maxTokens });
     if (JSON.stringify(m.input ?? null) !== JSON.stringify(want.input)) diffs.push({ field: "input", from: m.input, to: want.input });
     const oldEfforts = m.reasoningEfforts === undefined ? undefined : m.reasoningEfforts;
     if (JSON.stringify(oldEfforts ?? null) !== JSON.stringify(decl.efforts === false ? false : decl.efforts)) {
@@ -235,7 +260,7 @@ async function main() {
     }
 
     if (!diffs.length) { changes.push({ ...t, diffs: [] }); continue; }
-    changes.push({ ...t, diffs, want, decl });
+    changes.push({ ...t, diffs, want, decl, pick });
   }
 
   const pending = changes.filter((c) => c.diffs.length);
@@ -277,7 +302,7 @@ async function main() {
   for (const c of pending) {
     const m = c.model;
     m.contextWindow = c.want.contextWindow;
-    m.maxTokens = c.want.maxTokens;
+    if (!c.pick?.noEvidenceNoField) m.maxTokens = c.want.maxTokens;
     m.input = c.want.input;
     m.reasoningEfforts = c.decl.efforts === false ? false : c.decl.efforts;
     if (c.decl.compat) m.compat = { ...(m.compat && typeof m.compat === "object" ? m.compat : {}), ...c.decl.compat };
@@ -312,7 +337,7 @@ async function main() {
   }
   // 从后往前替换，避免索引错位：先按原始文本定位每个路由块的起止
   // v0.3.8（P0-1）：用 findRouteBlock —— 兄弟路由同缩进，旧扫描会把它们吞掉。
-  const curLines = next.split("\n");
+  let curLines = next.split("\n");
   const spots = [];
   for (const routeName of rendered.keys()) {
     const r = findRouteBlock(curLines, routeName, childIndent);
@@ -320,10 +345,41 @@ async function main() {
     spots.push({ i: r.start, j: r.end, block: rendered.get(routeName) });
   }
   spots.sort((a, b) => b.i - a.i);
-  for (const s of spots) {
-    next = [...curLines.slice(0, s.i), ...s.block.split("\n"), ...curLines.slice(s.j)].join("\n");
+  // v0.3.9（审计 v0.3.8 P1-1）：旧版每次都从 stale 的 curLines 重建 next，
+  // 多路由时只有最后处理（索引最小）的那条活下来，却报「已修正 N 个模型」。
+  // 降序替换时低位索引不受影响，因此只需在同一个 lines 数组上顺序改。
+  for (const sp of spots) {
+    curLines = [...curLines.slice(0, sp.i), ...sp.block.split("\n"), ...curLines.slice(sp.j)];
   }
+  if (spots.length !== [...rendered.keys()].length) {
+    console.error("内部错误：定位到的路由块数量与待改数量不一致，未改动文件");
+    process.exit(1);
+  }
+  next = curLines.join("\n");
   const outText = applyEol(next, eol);
+
+  // v0.3.9（审计 v0.3.8 P2-3）：旧版「先写盘、再整份复验、失败回滚」——文件会被真实替换过，
+  // dsh-hmr 可能读到瞬时坏配置。现在改成**先整份预验**，不通过就一个字节都不写。
+  {
+    let fullDoc;
+    try { fullDoc = YAML.parse(normalizeEol(next)); } catch (e) {
+      console.error(`重渲染后的 YAML 解析失败，未改动文件：${String(e?.message ?? e)}`);
+      process.exit(1);
+    }
+    const fullProviders = fullDoc?.find?.((x) => x?.id === "llm-pi-ai")?.config?.providers;
+    try {
+      const whole = flattenVerify(await verifyLoadPath(pluginRoot, fullProviders, "strict", { compaction }));
+      if (!whole.ok) {
+        console.error("整份文件复验不通过（含无关路由），未改动文件：");
+        for (const f of whole.failures.slice(0, 10)) console.error(`  ✗ ${f}`);
+        logAttempt(o.log, { cmd: "repair", patch: o.patch, status: "fail", phases: [{ name: "整份预验", ok: false, detail: whole.failures.join("；") }] });
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error(`整份预验跑不起来，未改动文件：${String(e?.message ?? e)}`);
+      process.exit(1);
+    }
+  }
 
   // ── 6. 备份 + 原子写 ──
   // v0.3.8（P1-4）：读入 → 计算 → 写盘之间有秒级窗口，别人在这期间改了文件，

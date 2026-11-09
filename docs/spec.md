@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.3.8 ｜ **代码提交**：`c95b40d`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.3.9 ｜ **代码提交**：`HASH_PLACEHOLDER`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -20,7 +20,27 @@
 
 ---
 
-### 0.0 本轮修订（v0.3.8）——三份对抗审计的结论与修正
+### 0.0 本轮修订（v0.3.9）——第三轮审计后的修正
+
+第三轮三份审计（`audit-breaker-v37` 破坏实验、`audit-docs-v37` 照文档敲、`audit-fix-verify` 机制核验，对象都是冻结副本 `/tmp/audit-v038`）共提出 1 个 P0、4 个 P1、十余条 P2/P3。逐条落地：
+
+| 审计项 | 旧版实际行为 | v0.3.9 |
+|---|---|---|
+| **P0** compaction 配置不合插件加载规则 | 所有工具仍打 ✓（连 `--apply` 也写进去），DSH 启动才抛 | 新增 `validateCompactionConfig()`，7 处工具入口先拒、一个字节不写 |
+| **P1** repair 多路由 | 用 stale 行数组重建，只真改 1 条，却报「已修正 3 个模型」 | 同一数组降序替换 + 断言行数，三条全改 |
+| **P1** repair 遇 BOM | 指纹用剥 BOM 后的文本 → 恒判「被并发修改」，BOM 文件修不了 | 指纹对原始字节，BOM 只影响写出内容 |
+| **P1** repair 空 probe | 凭空写 `maxTokens: 32768` | 没测到上限且模型原本没写 → 不新增该字段 |
+| **P1** repair `--route` | 同路由下别的模型被套用同一份测量 | 只改探针那个模型，新增 `--all-models` 显式放开 |
+| **P2** repair 写盘时序 | 先写盘再复验、失败回滚（瞬时不合法） | 写盘前整份预验，不通过不落盘 |
+| **P2** 思考声明不一致 | repair 与 inject 对同一份 probe 写出不同结果 | 统一走 `thinkingFromProbe()` |
+| **P2** verify-effective | 按 mtime 降序 → latest 被最老会话覆盖；图片挂在 `"?"` | 按时间升序；图片挂起到下一次 `request/*` 再归属 |
+| **P3** context-budget | `--ctx 1.5` 出 `undefined` 且 exit 1；文档说 gap 小 exit 1 | 非整数 exit 2 并回显收到的值；gap 只警告，exit 0 |
+
+此外修正了三处「机制不等价」：`thresholdRatio` 越界、`headroomTokens:0` 配显式 `maxTokens`、显式 `retainTokens` 时豁免比例比较。测试 87 → **95 条（21 组）**，新增组 21 五条，每条都有旧代码红 / 新代码绿的红跑证据。
+
+---
+
+### 0.0b 上一轮修订（v0.3.8）——三份对抗审计的结论与修正
 
 这一版不是「又加功能」，而是**三个子代理对 v0.3.7 的对抗审计**（冻结副本 `git archive d14d19d` → `/tmp/audit-v037`，只读，破坏实验全在 `/tmp`）之后的修正。三份审计的关键结论：
 
@@ -34,7 +54,7 @@
 
 1. 「`lib/compaction.mjs` 是插件公式的唯一副本」→ 改成「语义对齐的独立实现」，并显式列出三处差异（§2.4）。
 2. 「不写 `supportsReasoningEffort` 就不会发 `reasoning_effort`」→ 错：pi-ai 对未知 provider 默认 `true`，实测会发（§2.7 的 wire 表）。
-3. 「4 条 wire 测试验证了序列化」→ 假：旧写法把跳过条件函数当成了测试体，4 条永远 ✔ 一行没跑。现在 87 条里 0 skip。
+3. 「4 条 wire 测试验证了序列化」→ 假：旧写法把跳过条件函数当成了测试体，4 条永远 ✔ 一行没跑。现在 95 条里 0 skip。
 4. 「`verify-effective` 能证明发过图」→ 假：旧代码读 `data.message.content`，真实会话里图在 `data.content`，所以「发过图」恒 0（§5 第 17 条）。
 5. 「`gap < 30000` 是会被 DSH 拒绝的错误」→ 错：那是工具的工程警告，插件的硬失败只有 `B<=0` / `pressure<=0` / `retain>=threshold` 等（§2.4）。
 
@@ -51,7 +71,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 8 个零依赖脚本 + 9 个共享库 + 一份可直接抄的声明模板 + 87 条回归测试（含 4 条真实 wire 断言，不再有「跳过也变绿」的空跑用例）。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 8 个零依赖脚本 + 9 个共享库 + 一份可直接抄的声明模板 + 95 条回归测试（含 4 条真实 wire 断言，不再有「跳过也变绿」的空跑用例）。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -188,7 +208,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 
 - **硬失败（`hardFailures`，DSH 真会抛）**：`B <= 0`、`pressure <= 0`、`retain >= threshold`；`headroomTokens` 不是正整数（插件 `:59-63` `assertPositiveInteger`）；`retainRatio >= thresholdRatio`（`validateRatioRetention`）。
 - **工程警告（`warnings`，DSH 不检）**：`gap < 30000`。工具把它当「抖动风险」提示，但**不**判 `ok=false`——审计给的实测反例是 `ctx=100000 / max=20000 / headroom=65536`：工具旧版判红，而真实插件能正常启动。
-- **保留量优先级**：`policy.retainTokens > policy.retainRatio > 全局 retainTokens/retainRatio`（照 `resolveTargetPolicy` `:94-111` + `resolveRetention` `:153-157`）。旧版让全局 `retainTokens` 盖掉 policy 的 `retainRatio`，审计实测出「工具绿 / 真插件抛 TargetPressureConfigError」。
+- **保留量优先级**：`policy.retainTokens > policy.retainRatio > 全局 retainTokens/retainRatio`（照 `resolveTargetPolicy` `:94-111` + `resolveRetention` `:148-152`；`:153-157` 是 `validateRatioRetention`）。旧版让全局 `retainTokens` 盖掉 policy 的 `retainRatio`，审计实测出「工具绿 / 真插件抛 TargetPressureConfigError」。
 
 **工程后果 2b（v0.3.1 修正）**：安全取值的下限不是「能加载」，而是「`gap >= 30000`」。但下界**不能**用 `B_min = 30000/0.84` 反推——`threshold = min(0.8·ctx, B − headroom)` 里那项 headroom 也要吃掉 gap。正确做法是数值求解（`lib/compaction.mjs` 的 `minContextWindowFor`）：实测 `maxTokens=4096` 时窗口要 **≥ 117829**、`16384` → **130117**、`65536` → **179269**（headroom=65536、minGap=30000）。v0.3.0 曾写成 `maxTokens + headroom + 35715`，漏了 headroom 进 gap，本版已改正。
 
@@ -241,7 +261,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 
 **【读码】** 可选值清单在 `dsh-llm-pi-ai/lib/index.js:309` 起（11 个）；思考档位 7 个（`:299`：off / minimal / low / medium / high / xhigh / max）。
 
-**v0.3.8 更正（真实 wire 实测，不再是推测）**：`reasoningEffort` 只要非空，`enable_thinking` 就是 `true`——**「不写 `supportsReasoningEffort`」不等于「不发 `reasoning_effort`」**。pi-ai 对未知 provider 的 `getCompat` 默认 `supportsReasoningEffort: true`（`index.js:1273` / `:1318`），实测请求体：
+**v0.3.8 更正（真实 wire 实测，不再是推测）**：`reasoningEffort` 只要非空，`enable_thinking` 就是 `true`——**「不写 `supportsReasoningEffort`」不等于「不发 `reasoning_effort`」**。pi-ai 对未知 provider 的 `getCompat` 默认 `supportsReasoningEffort: true`（默认值来自 `detectCompat` `:1273`，`getCompat` 声明 `:1318`、覆盖 `:1325`），实测请求体：
 
 | 声明 | low 档请求体 | high 档请求体 |
 |---|---|---|
@@ -322,7 +342,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 |---|---|---|---|---|
 | `probe-capabilities.mjs` | 探测端点能力，输出 JSON / YAML 片段 | `--base` `--model`（必填）、`--key`/`--key-env`/`--key-file` 三选一、`--yaml` `--json` `--window` `--out DIR` | 0 成功；1 关键步骤失败；2 用法错误 | 默认 <1k token；`--window` 会发几十万 token 输入 |
 | `resolve-check.mjs` | 用真实两段加载路径预演一份 YAML | `--patch`（可重复，默认 `examples/cordis.patch.yml`，可用 `DSH_HOME_PROFILE_PATCH` 覆盖）、`--plugin-root`、`--lint`、`--budget`、`--json`、`--quiet` | 0 全通过；1 有路由失败/审计报错；2 用法或找不到插件 | 不花钱 |
-| `context-budget.mjs` | 纯计算 threshold / retain / gap，反推 ctx 下界 | `--ctx` `--max`、`--headroom` `--retain-ratio` `--threshold-ratio` `--min-gap` `--json` | 0 安全；1 有硬失败/抖动风险；2 用法错误 | 不花钱 |
+| `context-budget.mjs` | 纯计算 threshold / retain / gap，反推 ctx 下界 | `--ctx` `--max`、`--headroom` `--retain-ratio` `--threshold-ratio` `--min-gap` `--json` | 0 安全（gap 不足只打 ⚠ 警告，仍为 0）；1 有硬失败；2 用法错误 | 不花钱 |
 | `inject-model.mjs` | 把一条探测结果安全写进 patch 文件 | `--patch` `--route` `--probe`（必填）、`--plugin-root`、`--dry-run`、`--force`、`--assume-ctx`/`--assume-contextWindow`、`--max`、`--api`、`--api-key-env` | 0 写入成功或 dry-run 通过；1 校验失败/拒绝写入；2 用法错误 | 不花钱 |
 | `merge-routes.mjs` | 批量导入路由，单条失败不拖累全局 | `--patch` `--from`（可重复，必填）、`--plugin`/`--plugin-root`、`--dry-run`、`--replace`、`--no-verify` | 0 有写入或已是最新；1 没有可写入条目/复验失败（已回滚）；2 用法错误 | 不花钱 |
 | `probe-matrix.mjs` | 跨版本沙箱复验同一份 YAML | `--patch`、`--versions a,b`、`--work DIR`、`--dsh-root`、`--keep` | 0 全通过且一致；非 0 有版本失败 | 不花钱（只装 npm 包） |
@@ -349,11 +369,12 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 |---|---|---|
 | `lib/schema-keys.mjs` | `ROUTE_KEYS` `MODEL_KEYS` `ROUTE_ONLY_MODEL_KEYS` `COMPAT_KEYS` `THINKING_FORMATS` `MODALITIES` `THINKING_LEVELS` | 与源码对齐的权威字段清单（测试组 3 会拿源码比对，源码变了就红）。v0.3.0 补上漏掉的 `thinkingBudgets`（源码 `index.js:1063`） |
 | `lib/audit.mjs` | `staticAudit(providers) → {level,code,msg}[]` | 不启动 DSH 的静态审计；v0.3.0 新增 3 条「两层都放行但序列化失效」：`thinking-format-without-efforts`、`thinking-budget-without-map`、`qwen-levels-may-collapse` |
-| `lib/compaction.mjs` | 同上 + `hardFailures`/`warnings` 拆分 | 工具的**压缩公式唯一实现**，被 context-budget、load-path 第 3 段、snippet、merge-routes、resolve-check、repair 六处复用。⚠ v0.3.8 更正：它与插件 `resolveCompactSpec` **语义对齐但不是逐字等价**——工具额外把「gap < 30000」当工程警告（`warnings`），插件不检；插件的 `config.maxTokens`（默认=headroomTokens，`:59-63`）与 `validateRatioRetention` 现已建模为**硬失败**（`hardFailures`），见 §2.4 |
+| `lib/compaction.mjs` | `computeBudget` `validateCompactionConfig` `compactionConfigFromPatch` `policyForRoute` `pickSafeMaxTokens` `minContextWindowFor`（+`hardFailures`/`warnings`） | 工具的**压缩公式唯一实现**，被 context-budget、load-path 第 3 段、snippet、merge-routes、resolve-check、repair 六处复用。⚠ v0.3.8 更正：它与插件 `resolveCompactSpec` **语义对齐但不是逐字等价**——工具额外把「gap < 30000」当工程警告（`warnings`），插件不检；插件的 `config.maxTokens`（默认=headroomTokens，`:59-63`）与 `validateRatioRetention` 现已建模为**硬失败**（`hardFailures`），见 §2.4 |
 | `lib/load-path.mjs` | `verifyLoadPath(pluginRoot, providers, mode, options) → {schema, semantic, budget, routes}` | 把插件入口复制成**临时目录里的探针**（不写进 node_modules），补 `export { resolveProfiles }`，跑**三段**：Config → resolveProfiles → 压缩预算 |
-| `lib/fs-safe.mjs` | `resolveWriteTarget` `atomicWriteFile` `backupFile` `rollbackFrom` | realpath 跟随软链、同目录临时文件 + 校验 + `rename` 原子替换、带时间戳备份与回滚 |
-| `lib/yaml-edit.mjs` | `locateProviders` `removeRouteBlock` `renderRouteYaml` `renderManagedBlock` `findManagedBlock` | 保留注释与格式地增删 providers 条目；缩进从目标文件探测 |
-| `lib/snippet.mjs` | `buildSnippet(...) → {yaml, chosenMaxTokens, budget, notes}`、`thinkingDecl(t) → {compat, efforts, notes}` | 证据 → YAML 片段的唯一出口；`maxTokens` 由 `pickSafeMaxTokens` 反推，不再硬编码 65536；v0.3.6 把「思考怎么声明」抽成 `thinkingDecl`，probe / snippet / repair 三处共用，避免规则漂移 |
+| `lib/fs-safe.mjs` | `resolveWriteTarget` `atomicWriteFile` `backupFile` `rollbackFrom` `contentFingerprint` `assertUnchanged` | realpath 跟随软链、同目录临时文件 + 校验 + `rename` 原子替换、带时间戳备份与回滚 |
+| `lib/yaml-edit.mjs` | `locateProviders` `findRouteBlock` `removeRouteBlock` `renderRouteYaml` `renderManagedBlock` `findManagedBlock` `detectEol` `normalizeEol` `applyEol` | 保留注释与格式地增删 providers 条目；缩进从目标文件探测 |
+| `lib/snippet.mjs` | `buildSnippet(...) → {yaml, chosenMaxTokens, budget, notes}`、`thinkingDecl(t)`、`thinkingFromProbe(probe)` → `{compat, efforts, notes}` | 证据 → YAML 片段的唯一出口；`maxTokens` 由 `pickSafeMaxTokens` 反推，不再硬编码 65536；v0.3.6 把「思考怎么声明」抽成 `thinkingDecl`，probe / snippet / repair 三处共用，避免规则漂移 |
+| `lib/usage.mjs` | `USAGE` `usageText(name)` `flagsOf(name)` | 8 个脚本 `--help` 的唯一来源；测试组 19 拿「源码里真实解析的 `--flag`」与它双向对账 |
 | `lib/runlog.mjs` | `attemptKey` `logAttempt` `logChange` `readRecords` `lastFailureFor` `describeFailure` | JSONL 运行日志：同一尝试键的**上一次失败**会被下一次记录自动带出（`prevFailureId`/`prevFailure`），回答「为什么上次没成功」 |
 
 ### 3.5 声明决策表（写什么、为什么）
@@ -445,13 +466,13 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 
 | # | 命令 | 结果 | 时间 |
 |---|---|---|---|
-| 1 | `npm test` | **82 pass / 0 fail / 0 skip**（18 个测试组） | 2026-11-09 |
+| 1 | `npm test` | **95 pass / 0 fail / 0 skip**（21 个测试组） | 2026-11-09 |
 | 2 | `npm run selfcheck` | exit 0（测试 + 示例预算 + 示例两段校验） | 2026-11-09 |
 | 3 | `node scripts/resolve-check.mjs --patch /root/.dsh/profiles/web/cordis.patch.yml --lint --budget` | exit 0；5 条真实路由全 ✓，静态审计无问题，预算全绿（gap 444163 / 650486 / 554264 / 554264 / 522486） | 2026-11-09 |
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 87 条测试的分组（19 组）
+### 4.2 95 条测试的分组（21 组）
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -470,11 +491,12 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 13 | 3 | v0.3.1 自审：`snippet` 致命（窗口太小）不写死 `maxTokens`、qwen 单档 / effort 双档 + `supportsReasoningEffort`、`minContextWindowFor` 数值下界（4096→117829） |
 | 14 | 2 | **probe 端到端**：mock 网关模拟「布尔开关端点」与「effort 端点」，跑完整 probe→结论→片段 链路 |
 | 15 | 6 | **第二轮对抗审计的 P0/P1 回归**：NaN 死循环、坏 YAML 打栈、重复 compaction 条目取最后一条、`--max` 被回退越过、CRLF 往返、并发写中止 |
-| 16 | 2 | **verify-effective**：用 `zstd` 造真实格式的会话文件，断言抓到「运行时 ctx=131072 但声明 1e6」「inputTokens 越过压缩阈值」「发过图但没声明 image」「context_length_exceeded 归并」；没有该模型时只标「未使用」不报错 |
+| 16 | 2 | **verify-effective**：用 `zstd` 造真实格式的会话文件，断言 exit 1、`problems=1`，并命中 `contextWindow=131072` / `context-overflow` / `image` 三个 match（不单独断言 inputTokens 阈值）；没有该模型时只标「未使用」不报错 |
 | 17 | 2 | **repair**：dry-run 不写盘且给出逐字段 diff；`--apply` 后文件真被改、留备份、写后复验通过、日志里既有 `change` 也有带「写后校验」阶段的 `attempt`；再跑一次「不需要修正」；窗口太小无法算出合法 maxTokens 时拒绝写盘 exit 1 |
 | 18 | 1 | **runlog**：同一尝试键先失败后成功，第二次记录自动带 `prevFailureId` + 人读的 `prevFailure` |
 | 19 | 1 | **`--help` 与实现双向对账（v0.3.8）**：`lib/usage.mjs` 的键必须与 `scripts/` 一一对应；每个脚本「源码里真实解析的 `--flag`」与「usage 文本里的 flag」双向 diff，漏写/多写都红 |
-| 20 | 3 | **compaction 对齐真插件（v0.3.8）**：policy `retainRatio` 压过全局 `retainTokens`（旧版工具绿、真插件抛）、`headroomTokens:0` 是硬失败（插件 `assertPositiveInteger`）、`gap` 不足只算 warning（`ok` 仍为 true） |
+| 20 | 6 | **compaction 对齐真插件（v0.3.8/v0.3.9）**：policy `retainRatio` 压过全局 `retainTokens`（旧版工具绿、真插件抛）、`headroomTokens:0` 是硬失败（插件 `assertPositiveInteger`）、`thresholdRatio` 越界是硬失败、`headroomTokens:0` + 显式 `maxTokens` 合法、显式 `retainTokens` 时豁免比例比较、`gap` 不足只算 warning（`ok` 仍为 true） |
+| 21 | 5 | **第三轮审计的 P0/P1 回归（v0.3.9）**：非法 compaction 配置四个工具全拒、repair 多路由全部真改、空 probe 不凭空写 `maxTokens`、`--route` 不污染同路由别的模型、旧 probe 下 repair 与 inject 的思考声明一致 |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
 
@@ -511,12 +533,15 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 
 **关于「4 条 ctx=1000000 为什么能过 lint」**（评审 Q&A 里问的）：它们过的是**结构性检查**——三段校验只证明「按你声明的数字算，配置能被加载、压缩不会自相矛盾」，不证明 `1000000` 是这家端点的真实窗口。这四条里的 `1000000` 是**显式写死的**（不是落默认值，所以审计不会报 `default-context-window`），但它们**没有跑过 `--window` 实测**，属于【未验】。真要坐实，得对每个端点跑一次 `probe-capabilities --window`。这也是本方案「声明必须由证据支撑」的自我打脸之处：**本机这份 profile 里就有 4 条未经证据的声明**。
 
-**运行时对账（v0.3.6，**【实测】**）**：`node scripts/verify-effective.mjs --patch ~/.dsh/profiles/web/cordis.patch.yml` 在本机真实会话里抓到一条**矛盾**——
+**运行时对账（v0.3.9，**【实测】** 2026-11-09）**：`node scripts/verify-effective.mjs --patch ~/.dsh/profiles/web/cordis.patch.yml --no-log` 读本机 8 个真实会话 / 18993 条事件：
 
 ```
-✗ custom-dashscope-aliyuncs / deepseek-v4.1-flash-1017  声明 ctx=1000000  实际 ctx=131072
-  · 运行时 contextWindow=131072，声明是 1000000 —— 「声明没生效」或被别的层覆盖
+✓ 没有发现声明与实际不一致（8 个会话 · 18993 条事件）
+  ✓ custom-dashscope-aliyuncs / deepseek-v4.1-flash-1017   一致（已观测）  实际 ctx=1M,131k  请求=2444  img=True  reason=True
+  · custom-modelscope-1 / …  请求=70      · custom-modelscope-2 / …  请求=97
 ```
+
+v0.3.7 曾用同一段数据判出「声明 1e6、运行时 131072 → 矛盾 exit 1」，那是**旧判据的误报**：它拿历史会话的旧 ctx 当现值。v0.3.8 起改成「只用最近一次请求的 ctx 判矛盾，更早的不同值降为提示」，所以现在是 exit 0。
 
 这正是 §5.3 说的「数字造假时预算检查会一路 ✓」的现实版：它能在**上线后**把矛盾抓出来，而不是等一次 400。同一份报告也给出了「哪些模型真的被用过 / 发过多少图 / 有没有 reasoning 信号」。
 
@@ -584,7 +609,7 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 
 ```bash
 git clone https://github.com/shiodomemiuna111/dsh-model-compat && cd dsh-model-compat
-npm test                                   # 87 条回归（19 组）
+npm test                                   # 95 条回归（21 组）
 npm run selfcheck                          # 测试 + 示例配置两段校验 + 预算
 node scripts/context-budget.mjs --ctx 131072 --max 128000   # 看「为什么会失败」
 ```
@@ -636,7 +661,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 4. **§3.5 的保守取值（`maxTokens` 32768~65536、`contextWindow` 填实测值）** 在大窗口（≥1M）模型上是否会带来不可接受的提前压缩？有没有更优的 headroom/thresholdRatio 组合？
 5. **§3.6 的「没证据就不写 compat」是否过于保守？** 有没有「不写 compat 就一定错」的协议（例如某些网关必须显式 `enable_thinking` 才开思考）？
 6. **§3.7 的写盘纪律** 还有哪些破坏场景没覆盖？（我已知：SIGKILL 残留、`--replace` 注释残留、并发两个进程同时写同一文件未加锁。）
-7. **§4 的证据强度**：87 条测试（其中 4 条真跑 pi-ai 序列化）+ 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
+7. **§4 的证据强度**：95 条测试（其中 4 条真跑 pi-ai 序列化）+ 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
 8. **§5 的边界**里，哪一条在你看来是「必须修才能交付」，哪一条可以接受为已知限制？
 
 ---
@@ -657,10 +682,12 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 |---|---|---|---|
 | `probe-capabilities` | 成功 | 关键步骤失败（输出上限被拒等） | 用法错误 |
 | `resolve-check` | 全部通过 | 有路由解析失败 / 审计有 error | 用法错误 / 找不到插件 |
-| `context-budget` | 安全 | 有硬失败或 gap 太小 | 参数错误 |
+| `context-budget` | 安全（gap 不足仅警告） | 有硬失败（DSH 会抛） | 参数错误（非整数等） |
 | `inject-model` | 写入成功或 dry-run 通过 | 校验失败 / 拒绝写入 | 用法错误 |
 | `merge-routes` | 有写入或已最新 | 没有可写入条目 / 复验失败（已回滚） | 用法错误 |
 | `probe-matrix` | 全通过且一致 | 有版本失败 | 用法错误 |
+| `verify-effective` | 没有发现不一致 | 有矛盾（声明与实际不符） | 用法错误 / 一个会话都读不出 |
+| `repair` | dry-run 有 diff 或 apply 成功 | 拒绝修正 / 校验不通过（未改动文件） | 用法错误 |
 
 ## 附录 C：术语
 

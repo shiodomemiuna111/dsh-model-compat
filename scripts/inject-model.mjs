@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { locateProviders, removeRouteBlock, renderRouteYaml, detectEol, normalizeEol, applyEol } from "../lib/yaml-edit.mjs";
 import { pickSafeMaxTokens } from "../lib/compaction.mjs";
+import { thinkingFromProbe } from "../lib/snippet.mjs";
 import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
 import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom, contentFingerprint, assertUnchanged } from "../lib/fs-safe.mjs";
 import { usageText } from "../lib/usage.mjs";
@@ -107,10 +108,24 @@ if (probeMax === null || probeMax === undefined) console.error("警告：输出�
 // 否则 --max 1024 会被阶梯/回退越过，写出网关必拒的大值。
 const gateCandidates = [Number(probeMax), Number(o.maxOverride)].filter((v) => Number.isFinite(v) && v > 0);
 const gateMax = gateCandidates.length ? Math.min(...gateCandidates) : null;
+// v0.3.9（第二轮审计 5）：早期反推也要带完整 policy，否则预算阶段才用 policy，
+// 会先给一个「按全局 headroom 算得通、按 policy 算不通」的值。
+const _cfg0 = (() => {
+  try {
+    const YAML = loadYaml();
+    const doc = YAML.parse(normalizeEol(readFileSync(o.patch, "utf8")));
+    return compactionConfigFromPatch(doc);
+  } catch { return { found: false, modelPolicies: [] }; }
+})();
+const _pol = o.route ? policyForRoute(_cfg0, o.route, s.model) : null;
 const pick = pickSafeMaxTokens({
   contextWindow: ctx,
   gateMax,
-  headroomTokens: o.headroom,
+  headroomTokens: _pol?.headroomTokens ?? o.headroom,
+  thresholdRatio: _pol?.thresholdRatio,
+  retainRatio: _pol?.retainRatio,
+  retainTokens: _pol?.retainTokens,
+  configMaxTokens: _cfg0.maxTokens,
 });
 const maxTokens = pick.maxTokens ?? Number(o.maxOverride) ?? 0;
 if (pick.maxTokens === null) {
@@ -118,16 +133,11 @@ if (pick.maxTokens === null) {
   process.exit(1);
 }
 const input = ["text", ...(s.vision ? ["image"] : [])];
-const switchable = Array.isArray(s.thinkingSwitchable) && s.thinkingSwitchable.length > 0;
-
-// thinkingFormat：只认探测给出的 switchFormat；没有证据就**不写**这个字段（宁可少写）。
-const fmt = switchable ? (s.switchFormat ?? null) : null;
-if (!fmt) console.error("提示：探测没证明这个端点能开/关思考，不写 compat（宁可少写，避免静默退化）。");
-// 只有真探测到「思考可开关」才写 compat；否则整块不写，别塞一个没证据的 supportsReasoningEffort。
-const effortProven = switchable && (s.thinkingSwitchable ?? []).some((v) => String(v).startsWith("reasoning_effort"));
-const compat = fmt
-  ? { thinkingFormat: fmt, ...(effortProven ? { supportsReasoningEffort: true } : {}) }
-  : null;
+// v0.3.9（P2-4）：思考声明改由 lib/snippet.mjs 的 thinkingFromProbe 统一推导，
+// repair 用的是同一个函数，两个工具不会再对同一份 probe 给出相反结论。
+const decl = thinkingFromProbe(s);
+for (const n of decl.notes) console.error(`  提示：${n}`);
+const compat = decl.compat;
 
 // 压缩联动自检：三个数字（ctx / maxTokens / headroom）必须过 dsh-compaction-basic 的硬约束。
 // 公式来自 lib/compaction.mjs（唯一副本）；具体 headroom 在读到目标 patch 里的
@@ -145,6 +155,7 @@ function budgetCheck(compactionCfg) {
     thresholdRatio: policy.thresholdRatio,
     retainRatio: policy.retainRatio,
     retainTokens: policy.retainTokens,
+    configMaxTokens: compactionCfg?.maxTokens,
   });
 }
 
@@ -165,16 +176,9 @@ const profile = {
     maxTokens,
     input,
     ...(compat ? { compat } : {}),
-    // v0.3.1：档位只在实测证明「开关能变」时才写；off 档只在实测关得掉时写；
-    // 多档只在 reasoning_effort 真的生效时写（否则 UI 上是两个等价档）。
-    ...(switchable
-      ? {
-          reasoningEfforts: {
-            ...(s.thinkingCanDisable === false ? {} : { off: null }),
-            ...(effortProven ? { low: "low", high: "high" } : { high: "high" }),
-          },
-        }
-      : { reasoningEfforts: false }),
+    // 档位由 thinkingFromProbe 统一决定（off 只在真关得掉时写；多档只在 reasoning_effort
+    // 真生效时写；没有思考证据时写 false）。
+    reasoningEfforts: decl.efforts === false ? false : decl.efforts,
   }],
 };
 
@@ -233,6 +237,11 @@ for (const lp of layerPaths) {
 
 // 第 3 段：压缩预算（按真实层叠顺序算，后写覆盖前写）
 const compactionCfg = compactionConfigFromPatch([...layerDocs.flat(), ...doc]);
+if (compactionCfg.validation && !compactionCfg.validation.ok) {
+  console.error("层叠后的 dsh-compaction-basic 配置在 DSH 加载期就会被拒（不会写入）：");
+  for (const f of compactionCfg.validation.failures) console.error("  ✗ " + f);
+  process.exit(1);
+}
 if (compactionCfg.duplicates?.length) console.error(`警告：层叠后有 ${compactionCfg.duplicates.length + 1} 条 dsh-compaction-basic，按 DSH 语义以最后一条为准`);
 const budget = budgetCheck(compactionCfg);
 if (!budget.ok && !o.force) {

@@ -32,9 +32,11 @@ import { usageText } from "../lib/usage.mjs";
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
+let EXTRA_NODE_MODULES = null;   // --node-modules DIR（v0.3.9：旧版文档化了却从没用过）
 function loadYaml() {
   const tries = [
     "yaml",
+    EXTRA_NODE_MODULES ? `${EXTRA_NODE_MODULES}/yaml` : null,
     "/opt/dsh/node_modules/yaml",
     process.env.DSH_NODE_MODULES ? `${process.env.DSH_NODE_MODULES}/yaml` : null,
   ].filter(Boolean);
@@ -92,7 +94,10 @@ export function loadSessions(dir, limit) {
   };
   walk(dir, 1);
   found.sort((a, b) => b.mtime - a.mtime);
-  for (const s of found.slice(0, limit)) {
+  // v0.3.9（P2-1）：取最近 limit 个会话后按**时间升序**处理，这样
+  // latestContextWindow 由最新会话写入；旧版降序处理，最后被最老会话覆盖。
+  const picked = found.slice(0, limit).reverse();
+  for (const s of picked) {
     try {
       const text = zstdDecompressSync(readFileSync(s.file)).toString("utf8");
       const events = text.split("\n").filter(Boolean).map((l) => {
@@ -131,6 +136,13 @@ export function collectFacts(events) {
   // assistant/message 本身不带 provider/model：按事件顺序用最近一次 request/* 的配置归属
   // （同一会话里换模型是可能的，所以每会话各自跟踪，不要跨会话泄漏）。
   const current = new Map();
+  // v0.3.9（P2-2）：会话开头的 user/message（图）出现在 request/context 之前，
+  // 旧版按「最近一次 request」归属会记到 "?"；先挂起，等下一次 request 归属。
+  const pendingImages = new Map();
+  const flushImages = (sid, provider, model) => {
+    const n = pendingImages.get(sid) ?? 0;
+    if (n) { get(provider, model).imageMessages += n; pendingImages.delete(sid); }
+  };
   const curOf = (sid) => current.get(sid) ?? { provider: "?", model: "?" };
   for (const e of events) {
     const d = e.data ?? {};
@@ -140,12 +152,14 @@ export function collectFacts(events) {
       const f = get(c.provider, c.model);
       if (Number.isFinite(d.contextWindow)) { f.contextWindows.add(d.contextWindow); f.latestContextWindow = d.contextWindow; }
       f.sessions.add(e.session);
+      flushImages(e.session, c.provider, c.model);
     } else if (e.type === "request/header") {
       const c = d.header?.config ?? {};
       if (c.provider || c.model) {
         const cfg = { provider: c.provider ?? "?", model: c.model ?? "?" };
         current.set(e.session, cfg);
         get(cfg.provider, cfg.model).sessions.add(e.session);
+        flushImages(e.session, cfg.provider, cfg.model);
       }
     } else if (e.type === "assistant/message") {
       const cfg = curOf(e.session);
@@ -155,15 +169,15 @@ export function collectFacts(events) {
       const u = d.usage ?? {};
       if (Number.isFinite(u.inputTokens)) f.maxInputTokens = Math.max(f.maxInputTokens, u.inputTokens);
       const content = (d.content ?? d.message?.content) ?? [];
-      if (Array.isArray(content)) {
-        if (content.some((c) => c?.type === "image")) f.imageMessages += 1;
-        if (content.some((c) => c?.type === "reasoning")) f.reasoningMessages += 1;
-      }
+      if (Array.isArray(content) && content.some((c) => c?.type === "reasoning")) f.reasoningMessages += 1;
+      // 注意：assistant/message 里的 image 是**输出**图（模型生成/回传），不是「我们发了图」，
+      // v0.3.9（P2-2）：旧版把它计入 imageMessages，会把纯文本路由误报成发过图。
     } else if (e.type === "user/message") {
       const content = (d.content ?? d.message?.content) ?? [];
       if (Array.isArray(content) && content.some((c) => c?.type === "image")) {
-        const cfg = curOf(e.session);
-        get(cfg.provider, cfg.model).imageMessages += 1;
+        const cur = current.get(e.session);
+        if (cur) get(cur.provider, cur.model).imageMessages += 1;
+        else pendingImages.set(e.session, (pendingImages.get(e.session) ?? 0) + 1);
       }
     } else if (e.type === "assistant/attempt") {
       const cfg = curOf(e.session);
@@ -212,7 +226,7 @@ export function reconcile({ facts, providers, compaction }) {
         ? m.maxTokens
         : (Number.isFinite(route.defaultMaxTokens) ? route.defaultMaxTokens : 128000);
       const declaredImage = Array.isArray(m.input) ? m.input.includes("image") : Array.isArray(route.defaultInput) ? route.defaultInput.includes("image") : false;
-      const budget = computeBudget({ contextWindow: declaredCtx, reservedCompletionTokens: declaredMax, headroomTokens: compaction.headroomTokens, thresholdRatio: compaction.thresholdRatio, retainRatio: compaction.retainRatio, retainTokens: compaction.retainTokens });
+      const budget = computeBudget({ contextWindow: declaredCtx, reservedCompletionTokens: declaredMax, headroomTokens: compaction.headroomTokens, thresholdRatio: compaction.thresholdRatio, retainRatio: compaction.retainRatio, retainTokens: compaction.retainTokens, configMaxTokens: compaction.maxTokens });
 
       const row = {
         route: routeName, model: id,
@@ -261,7 +275,8 @@ export function reconcile({ facts, providers, compaction }) {
         if (!byClass.has(c.id)) byClass.set(c.id, { c, n: 0, sample: msg });
         byClass.get(c.id).n += 1;
       }
-      row.warnings = [];
+      // v0.3.9（第二轮审计）：旧版这里 `row.warnings = []` 把上面刚收集的
+      // 「历史 ctx 提示」整段清空，只剩限流类提示 —— 是真的丢信息。
       for (const { c, n, sample } of byClass.values()) {
         const line = `[${c.id}] ${c.hint}（${n} 次）：${sample.slice(0, 160)}`;
         // 只有「声明与实际矛盾」类才算 error；限流/鉴权是环境噪音，单列 warning。
@@ -292,6 +307,7 @@ function main() {
     console.log(usageText("verify-effective.mjs"));
     return;
   }
+  if (o.nodeModules) EXTRA_NODE_MODULES = o.nodeModules;
   if (!o.patch) { console.error("缺少 --patch（或设置 DSH_HOME_PROFILE_PATCH）"); process.exit(2); }
   if (!existsSync(o.patch)) { console.error(`读不到补丁：${o.patch}`); process.exit(2); }
 
@@ -309,6 +325,8 @@ function main() {
   if (!providers || typeof providers !== "object") { console.error("补丁里没有 llm-pi-ai 条目 / 没有 providers:"); process.exit(2); }
 
   const compactionConfig = compactionConfigFromPatch(doc);
+  // v0.3.9（审计 v0.3.8 P0-1）：配置本身在 DSH 加载期就会被拒时，先报出来（exit 1）。
+  const configFailures = compactionConfig.validation && !compactionConfig.validation.ok ? compactionConfig.validation.failures : [];
   const compaction = {
     headroomTokens: compactionConfig.headroomTokens ?? 65536,
     thresholdRatio: compactionConfig.thresholdRatio ?? 0.8,
@@ -326,9 +344,11 @@ function main() {
   const phases = [
     { name: "会话记录", ok: sessionsUsable, detail: sessionsUsable ? `${loaded.sessions.length} 个会话、${loaded.events.length} 条事件${loaded.skipped.length ? `（跳过 ${loaded.skipped.length} 个：${loaded.skipped[0].reason}）` : ""}` : `在 ${o.sessions} 下没有可用会话（找到 ${loaded.skipped.length} 个但读不出：${loaded.skipped.map((x) => x.reason).slice(0, 3).join("；") || "无文件"}）` },
     { name: "声明对账", ok: problems.length === 0, detail: problems.length ? `${problems.length} 个模型出现「声明与实际」矛盾` : (sessionsUsable ? "没有矛盾" : "没有可用会话，无法对账") },
+    { name: "compaction 配置", ok: configFailures.length === 0, detail: configFailures.length ? configFailures.join("；") : "加载期校验通过" },
   ];
   // P2-1：o.log === null 表示 --no-log，旧版 `log ?? DEFAULT_LOG` 又把它兜回默认文件。
-  logAttempt(log, { cmd: "verify-effective", patch: o.patch, status: problems.length ? "fail" : (sessionsUsable ? "ok" : "fail"), phases });
+  if (configFailures.length) { console.error("compaction 配置在 DSH 加载期就会被拒："); for (const f of configFailures) console.error(`  ✗ ${f}`); }
+  logAttempt(log, { cmd: "verify-effective", patch: o.patch, status: problems.length || configFailures.length ? "fail" : (sessionsUsable ? "ok" : "fail"), phases });
 
   if (o.json) {
     console.log(JSON.stringify({ sessions: loaded.sessions, skipped: loaded.skipped, rows, problems, compaction }, null, 2));
@@ -352,7 +372,7 @@ function main() {
     }
   }
   // P1-1：读不到任何会话 = 环境错误，exit 2（旧版 0，假绿）
-  process.exit(!sessionsUsable ? 2 : (problems.length ? 1 : 0));
+  process.exit(!sessionsUsable ? 2 : (problems.length || configFailures.length ? 1 : 0));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) main();

@@ -68,13 +68,22 @@ if (opt.patch) {
   catch (e) { console.error(`解析 ${opt.patch} 失败：${String(e?.message ?? e)}（文件坏了 / 是目录 / 没权限；不会改动任何东西）`); process.exit(2); }
   const cfg = compactionConfigFromPatch(doc);
   if (cfg.duplicates?.length) console.error(`警告：patch 里 dsh-compaction-basic 出现 ${cfg.duplicates.length + 1} 次，按 DSH 语义以最后一条为准`);
+  // v0.3.9（审计 v0.3.8 P0-1）：先按插件加载期规则校验整块配置，
+  // 不合规就当场失败 —— 否则工具报「安全」，DSH 启动直接抛。
+  if (cfg.validation && !cfg.validation.ok) {
+    console.error(`拒绝：${opt.patch} 里的 dsh-compaction-basic 配置在 DSH 加载期就会被拒：`);
+    for (const f of cfg.validation.failures) console.error("  ✗ " + f);
+    process.exit(1);
+  }
   fromPatch = policyForRoute(cfg, opt.provider, opt.model);
   if (!cfg.found && !opt.json) console.error(`提示：${opt.patch} 里没有 dsh-compaction-basic 配置块，按默认值计算（headroom=${DEFAULT_HEADROOM_TOKENS}）`);
 }
 
 // V6：--max 0 是合法的（未声明 maxTokens 时真实实现按 `maxTokens ?? 0` 处理，B=ctx）。
-if (!Number.isFinite(opt.ctx) || opt.ctx <= 0) { console.error("必须给 --ctx（正整数）"); process.exit(2); }
-if (!Number.isFinite(opt.max) || opt.max < 0) { console.error("--max 必须是非负整数（0 = 未声明 maxTokens）"); process.exit(2); }
+// v0.3.9（审计 v0.3.8 P3）：1.5 这种非整数也要按用法错误 exit 2，
+// 并明确说「正整数」，别让后面的预算算出一个 undefined。
+if (!Number.isInteger(opt.ctx) || opt.ctx <= 0) { console.error(`--ctx 必须是正整数，收到 ${JSON.stringify(opt.ctx)}`); process.exit(2); }
+if (!Number.isInteger(opt.max) || opt.max < 0) { console.error(`--max 必须是非负整数，收到 ${JSON.stringify(opt.max)}（0 = 未声明 maxTokens）`); process.exit(2); }
 
 const budget = computeBudget({
   contextWindow: opt.ctx,
@@ -83,6 +92,7 @@ const budget = computeBudget({
   thresholdRatio: opt.thresholdRatio ?? fromPatch?.thresholdRatio,
   retainRatio: opt.retainRatio ?? fromPatch?.retainRatio,
   retainTokens: opt.retainTokens ?? fromPatch?.retainTokens ?? null,
+  configMaxTokens: fromPatch?.maxTokens,
   minGap: opt.minGap,
 });
 

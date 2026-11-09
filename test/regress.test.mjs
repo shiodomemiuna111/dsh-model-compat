@@ -1128,7 +1128,7 @@ test("审计 P0-4：同 id 两条 dsh-compaction-basic，必须按最后一条�
   const probe = tmpYaml("probe.json", PROBE15);
   const r = await runNode([join(ROOT15, "scripts/inject-model.mjs"), "--patch", p, "--route", "rd", "--probe", probe, "--assume-ctx", "200000", "--plugin-root", "/opt/dsh/node_modules", "--dry-run"]);
   assert.equal(r.code, 1, "按 180000 算应被预算拒绝");
-  assert.match(r.stderr + r.stdout, /headroom\(180000\)/, "必须报出 180000 这个 headroom");
+  assert.match(r.stderr + r.stdout, /headroom[= ]?\(?180000\)?/, "必须报出 180000 这个 headroom");
 });
 
 test("审计 P1-6：--max 1024 不能被回退越过（写出 1024）", async () => {
@@ -1240,6 +1240,7 @@ const PROBE_FIXTURE = {
     contextWindow: 131072, gateMaxTokens: 65536, vision: true,
     switchFormat: "qwen", thinkingDefaultOn: true, thinkingCanDisable: true,
     thinkingCanEnable: true, thinkingSupportsEffort: false,
+    thinkingSwitchable: ["enable_thinking"],
   },
 };
 
@@ -1310,11 +1311,38 @@ test("组 20：policy 的 retainRatio 压过全局 retainTokens（照插件 reso
   assert.equal(b.ok, false, "retain(50000) ≥ threshold(34464)：DSH 首个压缩请求就会抛错");
 });
 
-test("组 20：headroomTokens=0 是加载期硬失败（插件 assertPositiveInteger）", async () => {
+test("组 20：headroomTokens=0 且没写 config.maxTokens → 加载期硬失败（插件 assertPositiveInteger）", async () => {
   const { computeBudget } = await import("../lib/compaction.mjs");
   const b = computeBudget({ contextWindow: 200000, reservedCompletionTokens: 10000, headroomTokens: 0 });
   assert.equal(b.ok, false);
-  assert.match(b.hardFailures.join(" "), /headroomTokens \(0\) 必须是正整数/);
+  assert.match(b.hardFailures.join(" "), /maxTokens \(0\) 必须是正整数/);
+});
+
+test("组 20：thresholdRatio 越界是加载期硬失败（插件 assertRatio 会拒）", async () => {
+  const { computeBudget } = await import("../lib/compaction.mjs");
+  const b = computeBudget({ contextWindow: 131072, reservedCompletionTokens: 16384, headroomTokens: 65536, thresholdRatio: 5 });
+  assert.equal(b.ok, false);
+  assert.match(b.hardFailures.join("；"), /thresholdRatio \(5\) 必须在 \(0, 1\] 内/);
+});
+
+test("组 20：headroomTokens 0 合法，前提是同时写 config.maxTokens（插件缺省取 headroom）", async () => {
+  const { computeBudget } = await import("../lib/compaction.mjs");
+  // 只写 headroomTokens: 0 → 插件 load 期 assertPositiveInteger(maxTokens=0) 抛错
+  const bad = computeBudget({ contextWindow: 200000, reservedCompletionTokens: 16384, headroomTokens: 0 });
+  assert.equal(bad.ok, false);
+  assert.match(bad.hardFailures.join("；"), /maxTokens \(0\) 必须是正整数/);
+  // 写 maxTokens: 1000 → 插件合法
+  const ok = computeBudget({ contextWindow: 200000, reservedCompletionTokens: 16384, headroomTokens: 0, configMaxTokens: 1000 });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.headroomTokens, 0);
+});
+
+test("组 20：显式 retainTokens 时豁免 retainRatio < thresholdRatio（插件 validateRatioRetention 跳过）", async () => {
+  const { computeBudget } = await import("../lib/compaction.mjs");
+  // 默认 retainRatio=.16 ≥ thresholdRatio=.1，但显式 retainTokens 时插件不查这条
+  const b = computeBudget({ contextWindow: 200000, reservedCompletionTokens: 100000, headroomTokens: 16384, thresholdRatio: 0.1, retainTokens: 4000 });
+  assert.equal(b.ok, true);
+  assert.equal(b.retainTokens, 4000);
 });
 
 test("组 20：gap 小于工程下限只是警告，不冒充 DSH 硬失败", async () => {
@@ -1373,4 +1401,153 @@ test("runlog：同一尝试键的失败会被下一次记录成 prevFailure（�
   assert.match(next.prevFailure, /上次失败在写后校验/);
   assert.equal(lastFailureFor(log, key).status, "fail");
   assert.match(describeFailure(lastFailureFor(log, key)), /压力预算为负/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 21：v0.3.8 对抗审计（第三轮）提出的真 bug
+//   ① compaction 配置在插件加载期就会拒，工具不能再报 ✓（P0-1）
+//   ② repair 多路由必须真的都改（旧版只活一条却报"已修正 N 个"）（P1-1）
+//   ③ 空 probe + 模型原本没 maxTokens → 不许凭空写一个（P1-3）
+//   ④ repair --route 不许把同路由下别的模型按同一探针改写（P1-4）
+//   ⑤ repair 与 inject 的思考声明必须一致（旧 probe 缺 thinkingSwitchable）（P2-4）
+// ═══════════════════════════════════════════════════════════════════════
+test("组 21：compaction 配置不合插件加载规则时，四个工具都必须拒绝（P0-1）", async () => {
+  const d = tmp();
+  const bad = join(d, "bad.yml");
+  writeFileSync(bad, `- id: dsh-compaction-basic
+  config:
+    thresholdRatio: 1.5
+- id: llm-pi-ai
+  config:
+    providers:
+      r1:
+        api: openai-completions
+        baseURL: https://x.invalid/v1
+        models:
+          - id: m
+            contextWindow: 1000000
+            maxTokens: 65536
+`);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify({ base: "https://x.invalid/v1", model: "m", summary: {} }));
+  const { validateCompactionConfig } = await import("../lib/compaction.mjs");
+  assert.equal(validateCompactionConfig({ thresholdRatio: 1.5 }).ok, false);
+  assert.equal(validateCompactionConfig({ retainTokens: 1, retainRatio: 0.2 }).ok, false);
+  assert.equal(validateCompactionConfig({ retainTokens: -5 }).ok, false);
+  assert.equal(validateCompactionConfig({ headroomTokens: 0 }).ok, false);
+  assert.equal(validateCompactionConfig({ headroomTokens: 0, maxTokens: 1000 }).ok, true);
+  assert.equal(validateCompactionConfig({ nope: 1 }).ok, false, "未知字段也要拒（插件 validateKeys）");
+
+  const rc = await runNode([join(ROOT, "scripts", "resolve-check.mjs"), "--patch", bad, "--lint"]);
+  assert.equal(rc.code, 1, "resolve-check 必须 exit 1");
+  assert.match(rc.stderr + rc.stdout, /thresholdRatio \(1.5\)/);
+  const cb = await runNode([join(ROOT, "scripts", "context-budget.mjs"), "--ctx", "131072", "--max", "16384", "--patch", bad]);
+  assert.equal(cb.code, 1, "context-budget 必须 exit 1");
+  const inj = await runNode([join(ROOT, "scripts", "inject-model.mjs"), "--patch", bad, "--route", "r2", "--probe", probe, "--dry-run"]);
+  assert.equal(inj.code, 1, "inject-model 必须 exit 1");
+});
+
+test("组 21：repair 多路由必须全部真的改写（旧版只活一条，P1-1）", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai
+  config:
+    providers:
+      r1:
+        api: openai-completions
+        baseURL: http://127.0.0.1:19431/v1
+        models:
+          - id: probe-m
+            contextWindow: 1000000
+            maxTokens: 128000
+            input: [text]
+      r2:
+        api: openai-completions
+        baseURL: http://127.0.0.1:19431/v1
+        models:
+          - id: probe-m
+            contextWindow: 1000000
+            maxTokens: 128000
+            input: [text]
+      r3:
+        api: openai-completions
+        baseURL: http://127.0.0.1:19431/v1
+        models:
+          - id: probe-m
+            contextWindow: 1000000
+            maxTokens: 128000
+            input: [text]
+`);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify(PROBE_FIXTURE));
+  const r = await runNode([join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--no-log", "--plugin-root", "/opt/dsh/node_modules"]);
+  assert.equal(r.code, 0, r.stderr);
+  const after = readFileSync(patch, "utf8");
+  const n = (after.match(/contextWindow: 131072/g) ?? []).length;
+  assert.equal(n, 3, `三条路由都必须被改，实际 ${n}：\n${after}`);
+  assert.doesNotMatch(after, /contextWindow: 1000000/);
+});
+
+test("组 21：空 probe + 模型原本没 maxTokens → repair 不许凭空写一个（P1-3）", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai
+  config:
+    providers:
+      hand:
+        api: openai-completions
+        baseURL: https://hand.invalid/v1
+        models:
+          - id: hm
+            contextWindow: 200000
+            input: [text]
+`);
+  const probe = join(d, "pempty.json");
+  writeFileSync(probe, JSON.stringify({ base: "https://hand.invalid/v1", model: "hm" }));
+  const r = await runNode([join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--no-log", "--plugin-root", "/opt/dsh/node_modules"]);
+  const after = readFileSync(patch, "utf8");
+  assert.doesNotMatch(after, /maxTokens:/, `没测到上限且原本没写，就不该新增 maxTokens：\n${after}\nexit=${r.code}`);
+});
+
+test("组 21：repair --route 只改探针那个模型，不把同路由别的模型按同一份测量改写（P1-4）", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai
+  config:
+    providers:
+      multi:
+        api: openai-completions
+        baseURL: http://127.0.0.1:19431/v1
+        models:
+          - id: probe-m
+            contextWindow: 1000000
+            maxTokens: 128000
+            input: [text]
+          - id: second-m
+            contextWindow: 200000
+            maxTokens: 8192
+            input: [text, image]
+`);
+  const probe = join(d, "probe.json");
+  writeFileSync(probe, JSON.stringify(PROBE_FIXTURE));
+  const r = await runNode([join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--route", "multi", "--apply", "--no-log", "--plugin-root", "/opt/dsh/node_modules"]);
+  assert.equal(r.code, 0, r.stderr);
+  const after = readFileSync(patch, "utf8");
+  assert.match(after, /contextWindow: 131072/, "probe-m 应被修");
+  assert.match(after, /contextWindow: 200000[\s\S]*maxTokens: 8192/, "second-m 必须原样保留");
+});
+
+test("组 21：旧 probe 缺 thinkingSwitchable 时，repair 与 inject 的思考声明一致（P2-4）", async () => {
+  const { thinkingFromProbe } = await import("../lib/snippet.mjs");
+  const oldProbe = { switchFormat: "qwen", thinkingDefaultOn: true, thinkingCanDisable: true, thinkingCanEnable: false };
+  const a = thinkingFromProbe(oldProbe);
+  const b = thinkingFromProbe({ ...oldProbe, thinkingSwitchable: [] });
+  assert.equal(a.compat, null);
+  assert.equal(a.efforts, false, "没有 thinkingSwitchable 就没有证据：不许写 reasoningEfforts");
+  assert.equal(b.efforts, false);
+  // 有证据（布尔开关）时才写：compat 带显式 false，档位只剩 high
+  const c = thinkingFromProbe({ ...oldProbe, thinkingSwitchable: ["enable_thinking"] });
+  assert.equal(c.compat.thinkingFormat, "qwen");
+  assert.equal(c.compat.supportsReasoningEffort, false);
+  assert.deepEqual(c.efforts, { off: null, high: "high" });
 });

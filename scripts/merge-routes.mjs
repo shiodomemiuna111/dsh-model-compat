@@ -143,6 +143,11 @@ function loadTargetCompaction() {
   try {
     const d = YAML.parse(readFileSync(o.patch, "utf8"));
     targetCompaction = compactionConfigFromPatch(d);
+    if (targetCompaction.validation && !targetCompaction.validation.ok) {
+      console.error(`目标文件里的 dsh-compaction-basic 配置在 DSH 加载期就会被拒（不会改动任何东西）：`);
+      for (const f of targetCompaction.validation.failures) console.error("  ✗ " + f);
+      process.exit(1);
+    }
   } catch (e) {
     console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e).split("\n")[0]}\n（文件不存在 / 是目录 / 没有权限；不会改动任何东西）`);
     process.exit(1);
@@ -196,7 +201,13 @@ for (const f of o.from) {
 // ── 4. 冲突检测：目标文件里已有同名路由（且不在托管块内）
 let targetText;
 let rawTarget = "";
-try { rawTarget = readFileSync(o.patch, "utf8"); targetText = normalizeEol(rawTarget); }
+try {
+  rawTarget = readFileSync(o.patch, "utf8");
+  // v0.3.9（审计 v0.3.8 P2-6）：Windows 存的 patch 常带 BOM，YAML.parse 会报
+  // "Unexpected scalar at node end"，旧版把它当「读不到文件」误导用户。这里剥掉 BOM。
+  if (rawTarget.charCodeAt(0) === 0xfeff) { console.error("提示：目标文件开头有 BOM（EF BB BF），已按无 BOM 处理。"); rawTarget = rawTarget.slice(1); }
+  targetText = normalizeEol(rawTarget);
+}
 catch (e) {
   console.error(`读不到目标文件 ${o.patch}：${String(e?.message ?? e)}\n（文件不存在 / 是目录 / 没有权限；不会改动任何东西）`);
   process.exit(1);

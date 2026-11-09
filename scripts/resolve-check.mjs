@@ -142,11 +142,17 @@ async function main() {
   let providers = {};
   const loaded = [];
   let compactionConfig = null;   // dsh-compaction-basic 的 headroom / modelPolicies（可能不在补丁里）
+  const configErrors = [];       // 插件加载期校验失败（v0.3.9）
   for (const file of patches) {
     const doc = await readYamlFile(resolvePath(file), plugin.root);
     loaded.push(file);
     const c = compactionConfigFromPatch(doc);
     if (c.found) compactionConfig = c;
+    // v0.3.9（审计 v0.3.8 P0-1）：插件加载期就会拒的 compaction 配置必须让本工具也红。
+    if (c.found && c.validation && !c.validation.ok) {
+      for (const f of c.validation.failures) console.error(`  ✗ compaction 配置（${file}）：${f}`);
+      configErrors.push(...c.validation.failures.map((f) => `${file}: ${f}`));
+    }
     const list = Array.isArray(doc) ? doc : [];
     for (const entry of list) {
       if (entry?.id === "llm-pi-ai" && entry.config?.providers) {
@@ -265,14 +271,16 @@ async function main() {
         thresholdRatio: policy.thresholdRatio,
         retainRatio: policy.retainRatio,
         retainTokens: policy.retainTokens,
+        configMaxTokens: compactionConfig?.maxTokens,
       });
       if (!b.ok) failed = true;
       budget.push({ route: r.route, id: r.id, B: b.messageBudgetTokens, pressure: b.pressureBudgetTokens, threshold: b.thresholdTokens, retain: b.retainTokens, gap: b.gap, problems: b.problems });
     }
   }
 
+  const configOk = configErrors.length === 0;
   if (args.json) {
-    console.log(JSON.stringify({ ok: !failed && !audit.some((a) => a.level === "error"), audit, patches: loaded, models: report, ...(args.budget ? { budget } : {}), ...(lintReport ? { lint: lintReport } : {}) }, null, 2));
+    console.log(JSON.stringify({ ok: !failed && configOk && !audit.some((a) => a.level === "error"), configErrors, audit, patches: loaded, models: report, ...(args.budget ? { budget } : {}), ...(lintReport ? { lint: lintReport } : {}) }, null, 2));
   } else {
     console.log(`插件: ${plugin.root}`);
     console.log(`补丁: ${loaded.join(", ")}`);
@@ -287,11 +295,15 @@ async function main() {
     if (args.budget) {
       console.log(`\n压缩联动（headroom=${args.headroom}）：`);
       for (const b of budget) {
-        console.log(`  ${b.problems.length ? "✗" : "✓"} ${b.route}: threshold=${b.threshold} retain=${b.retain} gap=${b.gap}${b.problems.length ? "  ← " + b.problems.join("；") : ""}`);
+        // v0.3.9（第二轮审计）：warnings 不是失败，别用 ✗ 渲染（会造成「exit 0 却满页红叉」）。
+        const hard = b.problems.filter((x) => !String(x).startsWith("缓冲带 gap"));
+        const soft = b.problems.filter((x) => String(x).startsWith("缓冲带 gap"));
+        const mark = hard.length ? "✗" : soft.length ? "⚠" : "✓";
+        console.log(`  ${mark} ${b.route}: threshold=${b.threshold} retain=${b.retain} gap=${b.gap}${b.problems.length ? "  ← " + b.problems.join("；") : ""}`);
       }
     }
   }
-  return failed || audit.some((a) => a.level === "error") ? 1 : 0;
+  return failed || !configOk || audit.some((a) => a.level === "error") ? 1 : 0;
 }
 
 const DEFAULT_PATCH =
