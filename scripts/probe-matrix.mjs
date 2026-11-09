@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { join, dirname, resolve as rp } from "node:path";
 import { createRequire } from "node:module";
 import { usageText } from "../lib/usage.mjs";
+import { defaultPatchPath } from "../lib/defaults.mjs";
 
 const require = createRequire(import.meta.url);
 const argv = process.argv.slice(2);
@@ -39,7 +40,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "-h" || a === "--help") { console.log(usageText("probe-matrix.mjs")); process.exit(0); }
   else throw new Error(`unknown flag: ${a}`);
 }
-if (!opt.patch) { console.error("必须给 --patch"); process.exit(2); }
+if (!opt.patch) opt.patch = defaultPatchPath(); // v0.4.3：默认用本机 profile
 
 const nm = opt.dshRoot;
 const JSON_HEADERS = { name: "", version: "0.0.0-compat", type: "module", exports: { ".": "./index.mjs" } };
