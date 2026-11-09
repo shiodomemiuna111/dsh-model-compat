@@ -13,9 +13,8 @@
  * 原理：真实加载路径是两段 —— `Config(raw)`（schemastery 结构校验，index.js:1086/:2940）
  * 再 `resolveProfiles(..., "deferred")`（语义校验，index.js:1120）。V6 起两段都跑，
  * 只跑后者会把「Config 会拒」的坏值误报成静默放行。resolveProfiles 正式入口没导出，
- * 这里把 lib/index.js 复制成临时文件、补一行 export 再 import；退出时删除。
- * 这里把 lib/index.js 复制成临时文件、补一行 export，再 import 调用；退出时删除。
- * 不修改 node_modules 里的任何原文件。
+ * 实现：把 lib/index.js 复制成同目录临时文件、补一行 export 再 import；退出时删除。
+ * 不修改 node_modules 里的任何原文件（除临时探针，正常/信号退出都会清掉）。
  */
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { staticAudit } from "../lib/audit.mjs";
