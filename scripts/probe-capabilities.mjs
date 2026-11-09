@@ -31,6 +31,7 @@
  * 退出码：0 成功；1 关键步骤失败；2 用法错误
  */
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { classifyWindowStop, effortProven as effortProvenByData, median, reasoningTokensOf } from "../lib/probe-heuristics.mjs";
 import { buildSnippet } from "../lib/snippet.mjs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -43,7 +44,7 @@ const PNG_RED_32 =
   "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg==";
 
 function parseArgs(argv) {
-  const o = { yaml: false, json: false, window: false, out: null };
+  const o = { yaml: false, json: false, window: false, out: null, noEffortLevels: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -57,6 +58,7 @@ function parseArgs(argv) {
     else if (a === "--json") o.json = true;
     else if (a === "--no-window") o.window = false;
     else if (a === "--window") o.window = true;
+    else if (a === "--no-effort-levels") o.noEffortLevels = true;
     else if (a === "-h" || a === "--help") o.help = true;
     else throw new Error(`unknown flag: ${a}`);
   }
@@ -157,14 +159,7 @@ async function main() {
 
   // 思考证据（v0.3.0：只认 usage.completion_tokens_details.reasoning_tokens 太脆弱，
   // 很多网关只填 choices[0].message.reasoning_content，或者只给布尔）
-  const reasoningOf = (j) => {
-    const details = j?.usage?.completion_tokens_details;
-    if (typeof details?.reasoning_tokens === "number" && details.reasoning_tokens > 0) return details.reasoning_tokens;
-    if (details?.reasoning === true) return 1;
-    const rc = j?.choices?.[0]?.message?.reasoning_content;
-    if (typeof rc === "string" && rc.trim().length > 0) return rc.length;
-    return 0;
-  };
+  const reasoningOf = (j) => reasoningTokensOf(j);
   const nonEmpty = (j) => String(j?.choices?.[0]?.message?.content ?? "").trim().length > 0;
   // v0.3.8（P1-2）：有些网关对一切请求都回 200，body 却是 {"error":{...}} 或干脆没有
   // choices。旧版只看 status===200，于是「模型不存在」也会被当成成功，还会编造
@@ -267,8 +262,37 @@ async function main() {
   // supportsReasoningEffort 时 low/high 请求体逐字节相同）。判据是：
   // 真正让思考变化的写法是 reasoning_effort（而不是布尔开关）→ 说明网关认 effort。
   const effortMechanism = switchable.some((v) => String(v).startsWith("reasoning_effort"));
-  const supportsEffort = effortMechanism;
-  const levels = canDisable && canEnable && effortMechanism ? ["low", "high"] : ["high"];
+
+  // v0.4.0（外部评审 2b）：单发一次 low / high 就判「支持档位」会把采样噪声当能力。
+  // 思维链长度天然随机（同一 prompt 两次可能是 15 / 28 token）。这里对每档各采两次、
+  // 取中位数，要求 high 的 reasoning 至少是 low 的 2 倍且差距 ≥ 16 个 token 才算证明；
+  // 达不到就按「只证明了开关」处理（单档），并在步骤里写明实测数字。
+  let baseExtra = {};
+  if (!defaultOn) {
+    const winner = Object.entries(onResults).find(([, v]) => v.status === 200 && v.reasoning > 0);
+    if (winner) {
+      const e = { ...onVariants[winner[0]] };
+      delete e.reasoning_effort;
+      baseExtra = Object.keys(e).length ? e : {};
+    }
+  }
+  const sampleEffort = async (level) => {
+    const rr = await chat({ ...baseExtra, reasoning_effort: level }, question);
+    return { status: rr.status, reasoning: reasoningOf(rr.json) };
+  };
+  const lows = [], highs = [];
+  if (!o.noEffortLevels) {
+    for (let i = 0; i < 2; i++) { lows.push(await sampleEffort("low")); highs.push(await sampleEffort("high")); }
+  }
+  const lo = median(lows.map((x) => x.reasoning));
+  const hi = median(highs.map((x) => x.reasoning));
+  const effortSamplesOk = [...lows, ...highs].every((x) => x.status === 200);
+  const effortProven = effortSamplesOk && effortProvenByData(lows.map((x) => x.reasoning), highs.map((x) => x.reasoning));
+  step("thinking-effort", "~4×30 token", effortSamplesOk ? 200 : 0,
+    o.noEffortLevels ? "跳过（--no-effort-levels）"
+      : `low=${lo} high=${hi}（各 2 次中位数）→ ${effortProven ? "档位真的能拉长思考" : "差异不显著，按单档处理"}`);
+  const supportsEffort = effortProven;
+  const levels = effortProven ? ["low", "high"] : ["high"];
   const thinking = {
     format: switchFormat,
     defaultOn,
@@ -331,17 +355,33 @@ async function main() {
 
   // 7 窗口（可选）
   let contextWindow = null;
+  let windowNote = null;
   if (o.window) {
     const unit = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ";
     const mk = (n) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
-    let lo = 0, hi = null, lastOk = null;
+    let lastOk = null, hi = null, stopReason = null;
     for (const chars of [1000000, 2000000, 4000000, 8000000]) {
       const rr = await chat({ max_tokens: 16 }, [{ role: "user", content: `Count words: ${mk(chars)}` }]);
-      if (rr.status === 200) { lastOk = rr.json?.usage?.prompt_tokens ?? null; lo = chars; }
-      else { hi = chars; step("window-probe", "⚠ 大输入", rr.status, `chars=${chars} → ${JSON.stringify(rr.json?.error ?? rr.text.slice(0, 80)).slice(0, 160)}`); break; }
+      if (rr.status === 200) { lastOk = rr.json?.usage?.prompt_tokens ?? lastOk; continue; }
+      const errText = JSON.stringify(rr.json?.error ?? rr.text.slice(0, 200));
+      // v0.4.0（外部评审 4）：2M~8M 字符的请求体有 2~8MB，常被反代网关的
+      // client_max_body_size 拦成 413、或撞 TPM 限流 429 / 超时。
+      // 这些**不是**模型上下文上限，不能当成「窗口边界」。
+      hi = chars;
+      stopReason = classifyWindowStop({ status: rr.status, errText });
+      step("window-probe", "⚠ 大输入", rr.status, `chars=${chars} → ${stopReason}：${errText.slice(0, 160)}`);
+      break;
     }
-    if (lastOk) contextWindow = Math.floor((lastOk * 0.95) / 4096) * 4096;
-    step("window", "⚠ 几十万 token 输入", lastOk ? 200 : 0, lastOk ? `最大成功 prompt_tokens=${lastOk}${hi ? `，char=${hi} 失败` : ""} ⇒ 建议声明 ${contextWindow}` : "探测失败");
+    if (lastOk) {
+      contextWindow = Math.floor((lastOk * 0.95) / 4096) * 4096;
+      if (stopReason && stopReason !== "context-overflow") {
+        windowNote = `窗口只测到「至少 ${contextWindow}」（${lastOk} prompt tokens）：最后一次失败是 ${stopReason}，不是上下文超限，不能据此认定窗口就这么小；要更准请换更小的字符阶梯或直接用官方文档值`;
+      }
+    } else if (stopReason === "gateway-limit") {
+      windowNote = "窗口没测出来：请求被网关限制（413/429/超时）打断，这是网关行为，不是模型上下文上限";
+    }
+    step("window", "⚠ 几十万 token 输入", lastOk ? 200 : 0,
+      lastOk ? `最大成功 prompt_tokens=${lastOk}${hi ? `，char=${hi} 失败（${stopReason}）` : ""} ⇒ ${stopReason === "context-overflow" || !stopReason ? "建议声明" : "保守下界"} ${contextWindow}` : (windowNote ?? "探测失败"));
   } else {
     step("window", "跳过", 0, "默认不探测（花钱）；加 --window 才跑");
   }
@@ -356,7 +396,8 @@ async function main() {
     thinking,
   });
   findings.yaml = snippet.yaml;
-  findings.snippet = { chosenMaxTokens: snippet.chosenMaxTokens, budget: snippet.budget, notes: snippet.notes, fatal: snippet.fatal };
+  if (windowNote) snippet.notes.push(windowNote);
+  findings.snippet = { chosenMaxTokens: snippet.chosenMaxTokens, budget: snippet.budget, notes: snippet.notes, fatal: snippet.fatal, windowNote };
   findings.summary = {
     listedInModels: listed,
     modelFields,

@@ -148,6 +148,11 @@ export function collectFacts(events) {
     const d = e.data ?? {};
     if (e.type === "request/context") {
       const c = { provider: d.provider ?? "?", model: d.model ?? "?" };
+      // v0.4.0（外部评审 1c）：挂起的图只在「紧接着的下一次请求」里归属。模型/端点变了
+      // （包括上图被本地 UNSUPPORTED_CONTENT 拦下、用户换模型重发的情况）就作废，
+      // 否则会把 A 模型的图算到 B 模型头上。
+      const prev = current.get(e.session);
+      if (prev && (prev.provider !== c.provider || prev.model !== c.model)) pendingImages.delete(e.session);
       current.set(e.session, c);
       const f = get(c.provider, c.model);
       if (Number.isFinite(d.contextWindow)) { f.contextWindows.add(d.contextWindow); f.latestContextWindow = d.contextWindow; }
@@ -157,12 +162,16 @@ export function collectFacts(events) {
       const c = d.header?.config ?? {};
       if (c.provider || c.model) {
         const cfg = { provider: c.provider ?? "?", model: c.model ?? "?" };
+        const prev = current.get(e.session);
+        if (prev && (prev.provider !== cfg.provider || prev.model !== cfg.model)) pendingImages.delete(e.session);
         current.set(e.session, cfg);
         get(cfg.provider, cfg.model).sessions.add(e.session);
         flushImages(e.session, cfg.provider, cfg.model);
       }
     } else if (e.type === "assistant/message") {
       const cfg = curOf(e.session);
+      // 图如果是跟在这一轮的 request 之后才落盘的，也归属给这一轮
+      flushImages(e.session, cfg.provider, cfg.model);
       const f = get(cfg.provider, cfg.model);
       f.requests += 1;
       f.sessions.add(e.session);
@@ -175,13 +184,18 @@ export function collectFacts(events) {
     } else if (e.type === "user/message") {
       const content = (d.content ?? d.message?.content) ?? [];
       if (Array.isArray(content) && content.some((c) => c?.type === "image")) {
-        const cur = current.get(e.session);
-        if (cur) get(cur.provider, cur.model).imageMessages += 1;
-        else pendingImages.set(e.session, (pendingImages.get(e.session) ?? 0) + 1);
+        // v0.4.0（外部评审 1c）：一律先挂起，由**紧接着的** request/context（或同一轮
+        // 的 assistant/message）归属。旧版「当前有配置就直接记」会把「发图后本地被
+        // UNSUPPORTED_CONTENT 拦下、用户换模型重发」的图算到上一个模型头上。
+        pendingImages.set(e.session, (pendingImages.get(e.session) ?? 0) + 1);
       }
     } else if (e.type === "assistant/attempt") {
       const cfg = curOf(e.session);
       const stream = Array.isArray(d.stream) ? d.stream : [];
+      // 这一轮如果失败（含 pi-ai 在本地就抛 UNSUPPORTED_CONTENT，压根没落 request 事件），
+      // 挂起的图就必须丢弃：它没被任何模型真正收到过。
+      const anyError = stream.some((it) => it?.chunk?.reason?.kind === "error") || d.error || d.failure;
+      if (anyError) pendingImages.delete(e.session);
       for (const item of stream) {
         const reason = item?.chunk?.reason;
         if (reason?.kind === "error" && reason.failure?.message) {
@@ -192,6 +206,13 @@ export function collectFacts(events) {
       const cfg = { provider: d.provider ?? curOf(e.session).provider, model: d.model ?? curOf(e.session).model };
       get(cfg.provider, cfg.model).retries += 1;
     }
+  }
+  // 会话末尾还挂着的图：没有再发生模型切换，就归给最后那次请求的模型。
+  // （若中途切过模型，切换点已经 delete 过了，这里不会串到别的模型。）
+  for (const [sid, n] of pendingImages) {
+    if (!n) continue;
+    const cfg = curOf(sid);
+    if (cfg.provider && cfg.model) flushImages(sid, cfg.provider, cfg.model);
   }
   return facts;
 }
@@ -252,17 +273,26 @@ export function reconcile({ facts, providers, compaction }) {
 
       // v0.3.8（P2-7）：只拿**最近一次**请求的运行时 ctx 判矛盾；更早会话里的旧值
       // 多半是「声明后来才改的」，判 error 会长期假红，降级成 warning 并说明。
+      // v0.4.0（外部评审 1a）：`request/context.contextWindow` 是 **DSH 本地记录**当时
+      // 内存里的声明值，不是网关回报的物理窗口。所以这个比较只能证明「运行时加载的
+      // 不是现在这份声明」（HMR 没生效 / 中途改过 / 多层覆盖），不能证明网关窗口大小。
       const latestCtx = row.latestRuntimeCtx;
       if (Number.isFinite(latestCtx) && latestCtx !== declaredCtx) {
-        row.issues.push(`最近一次请求的 contextWindow=${latestCtx}，声明是 ${declaredCtx} —— 「声明没生效」或被别的层覆盖`);
+        row.issues.push(`运行时记录的 contextWindow=${latestCtx}，当前声明是 ${declaredCtx} —— 这是 DSH 本地声明值（不是网关回报），说明该会话跑的是旧声明：HMR 未生效或被别的层覆盖。重启/重载后应一致`);
       }
       for (const cw of row.runtimeCtx) {
         if (cw === declaredCtx) continue;
         if (Number.isFinite(latestCtx) && cw === latestCtx) continue; // 已在上面算 error
         row.warnings.push(`历史会话里出现过 contextWindow=${cw}（声明 ${declaredCtx}）—— 若声明是之后才改的，这是旧记录，可忽略`);
       }
-      if (row.maxInputTokens >= budget.thresholdTokens && budget.ok) {
-        row.issues.push(`最大输入 ${row.maxInputTokens} ≥ 压缩阈值 ${budget.thresholdTokens}：说明声明的大窗口/大 maxTokens 没有让压缩按预期触发`);
+      // v0.4.0（外部评审 1b）：单轮输入合法地越过阈值是常态（长粘贴/大工具输出会在
+      // **这一轮**就超过阈值，压缩在下一轮才发生）。旧版直接判「矛盾 exit 1」会误报。
+      // 真正的矛盾只有两种：单轮输入已经超过 messageBudget（B = ctx - maxTokens，必然 400），
+      // 或者出现了 context-overflow 而当时的输入远小于声明窗口（见下面的失败分类）。
+      if (Number.isFinite(budget.messageBudgetTokens) && row.maxInputTokens >= budget.messageBudgetTokens) {
+        row.issues.push(`最大单轮输入 ${row.maxInputTokens} ≥ 可用消息预算 ${budget.messageBudgetTokens}（= ctx - maxTokens）—— 这种请求本该被拒，若真的成功了，说明实际窗口比声明的更大`);
+      } else if (budget.ok && row.maxInputTokens >= budget.thresholdTokens) {
+        row.warnings.push(`本轮输入 ${row.maxInputTokens} 已达到压缩阈值 ${budget.thresholdTokens}（属正常：压缩在下一轮触发；若之后几轮输入仍不下降，才是压缩没生效）`);
       }
       if (row.imageUsed && !declaredImage) {
         row.issues.push(`会话里真的发过图（${row.imageMessages} 条含 image），但声明 input 不含 image`);
@@ -278,7 +308,12 @@ export function reconcile({ facts, providers, compaction }) {
       // v0.3.9（第二轮审计）：旧版这里 `row.warnings = []` 把上面刚收集的
       // 「历史 ctx 提示」整段清空，只剩限流类提示 —— 是真的丢信息。
       for (const { c, n, sample } of byClass.values()) {
-        const line = `[${c.id}] ${c.hint}（${n} 次）：${sample.slice(0, 160)}`;
+        let line = `[${c.id}] ${c.hint}（${n} 次）：${sample.slice(0, 160)}`;
+        // v0.4.0：这才是「网关窗口比声明小」的铁证 —— 真的超限了，而当时最大单轮输入
+        // 还没到声明的 contextWindow。
+        if (c.id === "context-overflow" && row.maxInputTokens > 0 && row.maxInputTokens < declaredCtx) {
+          line += `；最大单轮输入只有 ${row.maxInputTokens} 却报超限 → 实际窗口 < 声明的 ${declaredCtx}（这是唯一能证伪大窗口的运行时证据）`;
+        }
         // 只有「声明与实际矛盾」类才算 error；限流/鉴权是环境噪音，单列 warning。
         if (c.id === "context-overflow" || c.id === "image-unsupported" || c.id === "thinking-rejected") row.issues.push(line);
         else row.warnings.push(line);

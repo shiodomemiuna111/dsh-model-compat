@@ -1176,12 +1176,12 @@ test("verify-effective：抓到「运行时 contextWindow 与声明不符」和�
   mkdirSync(sdir, { recursive: true });
 
   const events = [
+    // v0.4.0（评审 1c）：图挂在 request 之前，随后被 request/context 归属给当轮模型。
+    // 真实会话里 user/message 的图在 data.content（v0.3.8 修过：不是 data.message.content）。
+    { type: "user/message", data: { content: [{ type: "image", source: "x" }, { type: "text", text: "看图" }] } },
     { type: "request/context", data: { provider: "custom-x", model: "m", contextWindow: 131072 } },
     { type: "request/header", data: { header: { config: { provider: "custom-x", model: "m" } } } },
     { type: "assistant/message", data: { usage: { inputTokens: 900000 }, message: { content: [{ type: "text", text: "hi" }] } } },
-    // v0.3.8（审计 v0.3.7 的 7）：真实会话里 user/message 的图在 data.content，
-    // 不是 data.message.content（fixture 之前按错路径造假，所以测试自洽通过）。
-    { type: "user/message", data: { content: [{ type: "image", source: "x" }, { type: "text", text: "看图" }] } },
     {
       type: "assistant/attempt",
       data: { stream: [{ chunk: { reason: { kind: "error", failure: { message: "400 context_length_exceeded: maximum context length is 131072 tokens" } } } }] },
@@ -1550,4 +1550,171 @@ test("组 21：旧 probe 缺 thinkingSwitchable 时，repair 与 inject 的思�
   assert.equal(c.compat.thinkingFormat, "qwen");
   assert.equal(c.compat.supportsReasoningEffort, false);
   assert.deepEqual(c.efforts, { off: null, high: "high" });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 22：第四轮外部评审（v0.4.0）
+//   · 窗口探测：413/429/超时 ≠ 上下文上限
+//   · 档位探测：单次采样噪声不能当「支持档位」
+//   · verify-effective：单轮输入越过阈值属正常（不要把压缩触发当矛盾）
+//   · verify-effective：挂起图片不在模型切换/失败后串到别的模型
+//   · repair：重渲染路由不许抹掉 headers / retryPolicy / thinkingBudgets 等扩展字段
+// ═══════════════════════════════════════════════════════════════════════
+test("组 22：窗口探测判据 —— 只有 context-overflow 才算撞到窗口，413/429/超时算网关限制", async () => {
+  const { classifyWindowStop } = await import("../lib/probe-heuristics.mjs");
+  assert.equal(classifyWindowStop({ status: 200, errText: "" }), "ok");
+  assert.equal(classifyWindowStop({ status: 400, errText: "context_length_exceeded: maximum context length is 131072 tokens" }), "context-overflow");
+  assert.equal(classifyWindowStop({ status: 400, errText: "This model's maximum context length is 8192 tokens" }), "context-overflow");
+  // 反证：这些都不是模型窗口，不能被当成边界（旧版只要非 200 就 break 并当成边界）
+  assert.equal(classifyWindowStop({ status: 413, errText: '{"error":"Payload Too Large"}' }), "gateway-limit");
+  assert.equal(classifyWindowStop({ status: 429, errText: "rate limit exceeded" }), "gateway-limit");
+  assert.equal(classifyWindowStop({ status: 0, errText: "socket hang up" }), "gateway-limit");
+  assert.equal(classifyWindowStop({ status: 408, errText: "request timeout" }), "gateway-limit");
+  // 未知错误既不算窗口也不算网关，调用方会写明「不确定」
+  assert.equal(classifyWindowStop({ status: 400, errText: '{"error":"bad request"}' }), "unknown-error");
+});
+
+test("组 22：档位判据 —— 采样噪声（15 vs 28）不能判「支持档位」，2 倍以上才认", async () => {
+  const { effortProven, median, reasoningTokensOf } = await import("../lib/probe-heuristics.mjs");
+  // 噪声：同一档两次都差不多，另一档只高一丁点 → 不认
+  assert.equal(effortProven([14, 16], [26, 30]), false);
+  // 真实差异：high 明显拉长（≥2 倍且 ≥16）→ 认
+  assert.equal(effortProven([12, 14], [180, 210]), true);
+  // 边界：刚好 16 且 2 倍
+  assert.equal(effortProven([16, 16], [32, 32]), true);
+  assert.equal(median([3, 9, 5]), 5);
+  // 多信号计数：usage、reasoning_content、布尔都要能认出来
+  assert.equal(reasoningTokensOf({ usage: { completion_tokens_details: { reasoning_tokens: 42 } } }), 42);
+  assert.equal(reasoningTokensOf({ choices: [{ message: { reasoning_content: "1234567890" } }] }), 10);
+  assert.equal(reasoningTokensOf({ choices: [{ message: { reasoning: true } }] }), 1);
+  assert.equal(reasoningTokensOf({ choices: [{ message: { content: "hi" } }] }), 0);
+});
+
+test("组 22：verify-effective —— 单轮输入越过压缩阈值只是警告，不算矛盾", async () => {
+  const { zstdCompressSync } = await import("node:zlib");
+  const fsm = await import("node:fs");
+  const d = tmp();
+  const sdir = join(d, "sessions", "--root-workspace--", "session-th");
+  fsm.mkdirSync(sdir, { recursive: true });
+  // 声明 ctx=1e6 / max=65536 → B=934464、threshold=800000；单轮输入 850000
+  // 属于「合法地越过阈值」：压缩在下一轮才发生，不是配置矛盾。
+  const events = [
+    { type: "request/context", data: { provider: "p", model: "m", contextWindow: 1000000 } },
+    { type: "assistant/message", data: { usage: { inputTokens: 850000, outputTokens: 10 }, content: [{ type: "text", text: "ok" }] } },
+  ];
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      p:\n        api: openai-completions\n        baseURL: https://p.invalid/v1\n        models:\n          - id: m\n            contextWindow: 1000000\n            maxTokens: 65536\n            input: [text]\n`);
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", join(d, "sessions"), "--json", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 0, `越过阈值不该 exit 1：${r.stdout?.slice(0, 400)}${r.stderr?.slice(0, 300)}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.problems.length, 0);
+  assert.match(out.rows[0].warnings.join(" | "), /压缩阈值/);
+});
+
+test("组 22：verify-effective —— 超限报错 + 输入远小于声明窗口才是「窗口比声明小」的铁证", async () => {
+  const { zstdCompressSync } = await import("node:zlib");
+  const fsm = await import("node:fs");
+  const d = tmp();
+  const sdir = join(d, "sessions", "--root-workspace--", "session-ov");
+  fsm.mkdirSync(sdir, { recursive: true });
+  const events = [
+    { type: "request/context", data: { provider: "p", model: "m", contextWindow: 1000000 } },
+    { type: "assistant/message", data: { usage: { inputTokens: 120000, outputTokens: 10 }, content: [{ type: "text", text: "ok" }] } },
+    { type: "assistant/attempt", data: { stream: [{ chunk: { reason: { kind: "error", failure: { message: "400 context_length_exceeded: maximum context length is 131072 tokens" } } } }] } },
+  ];
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      p:\n        api: openai-completions\n        baseURL: https://p.invalid/v1\n        models:\n          - id: m\n            contextWindow: 1000000\n            maxTokens: 65536\n            input: [text]\n`);
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", join(d, "sessions"), "--json", "--no-log"], { encoding: "utf8" });
+  assert.equal(r.status, 1);
+  const out = JSON.parse(r.stdout);
+  const issues = out.problems[0].issues.join(" | ");
+  assert.match(issues, /实际窗口 < 声明的 1000000/, issues);
+});
+
+test("组 22：verify-effective —— 挂起的图不会串到换模型后的另一个模型（评审 1c）", async () => {
+  const { zstdCompressSync } = await import("node:zlib");
+  const fsm = await import("node:fs");
+  const d = tmp();
+  const sdir = join(d, "sessions", "--root-workspace--", "session-img");
+  fsm.mkdirSync(sdir, { recursive: true });
+  const img = { content: [{ type: "image", source: "x" }] };
+  const events = [
+    // A 模型正常收图
+    { type: "user/message", data: img },
+    { type: "request/context", data: { provider: "p", model: "vision-m", contextWindow: 200000 } },
+    { type: "assistant/message", data: { usage: { inputTokens: 100, outputTokens: 5 }, content: [{ type: "text", text: "看到了" }] } },
+    // 再发一张图，但还没发请求就切换模型（相当于本地 UNSUPPORTED_CONTENT 被拦 / 用户改主意）
+    { type: "user/message", data: img },
+    { type: "request/context", data: { provider: "p", model: "text-m", contextWindow: 200000 } },
+    { type: "assistant/message", data: { usage: { inputTokens: 50, outputTokens: 5 }, content: [{ type: "text", text: "hi" }] } },
+  ];
+  writeFileSync(join(sdir, "session.v4.jsonl.zstd"), zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n")));
+  const patch = join(d, "p.yml");
+  writeFileSync(patch, `- id: llm-pi-ai\n  config:\n    providers:\n      p:\n        api: openai-completions\n        baseURL: https://p.invalid/v1\n        models:\n          - id: vision-m\n            contextWindow: 200000\n            maxTokens: 8192\n            input: [text, image]\n          - id: text-m\n            contextWindow: 200000\n            maxTokens: 8192\n            input: [text]\n`);
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "verify-effective.mjs"), "--patch", patch, "--sessions", join(d, "sessions"), "--json", "--no-log"], { encoding: "utf8" });
+  const out = JSON.parse(r.stdout);
+  const v = out.rows.find((x) => x.model === "vision-m");
+  const t = out.rows.find((x) => x.model === "text-m");
+  assert.equal(v.imageMessages, 1, JSON.stringify(v));
+  assert.equal(t.imageMessages, 0, `text-m 不该背这个锅：${JSON.stringify(t)}`);
+  assert.equal(out.problems.length, 0, JSON.stringify(out.problems));
+});
+
+test("组 22：repair --apply 不许抹掉路由上的 headers / retryPolicy / thinkingBudgets 等扩展字段", skipIfNoPlugin, async () => {
+  const d = tmp();
+  const patch = join(d, "p.yml");
+  const probe = join(d, "probe.json");
+  writeFileSync(patch, `- id: llm-pi-ai
+  config:
+    providers:
+      r1:
+        displayName: r1
+        api: openai-completions
+        baseURL: https://example.com/v1
+        apiKeyEnv: KEY
+        headers:
+          X-Test: "1"
+        retryPolicy:
+          mode: normal
+          maxRetries: 3
+        timeoutMs: 60000
+        thinkingBudgets:
+          low: 1024
+          high: 8192
+        transport: sse
+        models:
+          - id: probe-m
+            name: Probe
+            contextWindow: 1000000
+            maxTokens: 65536
+            input: [ text ]
+            reasoningEfforts:
+              off: null
+              low: "low"
+              high: "high"
+`);
+  writeFileSync(probe, JSON.stringify({
+    base: "https://example.com/v1", model: "probe-m",
+    summary: {
+      contextWindow: 131072, gateMaxTokens: 65536, vision: true,
+      switchFormat: "qwen", thinkingDefaultOn: true, thinkingCanDisable: true,
+      thinkingCanEnable: true, thinkingSupportsEffort: false,
+      thinkingSwitchable: ["enable_thinking"],
+    },
+  }));
+  const r = spawnSync(process.execPath, [join(ROOT, "scripts", "repair.mjs"), "--patch", patch, "--probe", probe, "--apply", "--no-log", "--plugin-root", PLUGIN], { encoding: "utf8" });
+  assert.equal(r.status, 0, `repair 失败：${r.stdout}${r.stderr}`);
+  const after = readFileSync(patch, "utf8");
+  // 被修字段确实变了
+  assert.match(after, /contextWindow: 131072/);
+  assert.match(after, /maxTokens: 16384/);
+  // 扩展字段一个都不能丢
+  assert.match(after, /headers:\n\s+X-Test: "1"/);
+  assert.match(after, /retryPolicy:\n\s+mode: normal\n\s+maxRetries: 3/);
+  assert.match(after, /timeoutMs: 60000/);
+  assert.match(after, /thinkingBudgets:\n\s+low: 1024\n\s+high: 8192/);
+  assert.match(after, /transport: sse/);
+  assert.match(after, /displayName: r1/);
 });

@@ -6,12 +6,23 @@
 > 窗口、模态、思考档位全都落到默认值（1M 上下文 / 128k 输出 / 只收文本），于是会出现
 > 「上下文突然爆」「说看不见图」「思考深度调不了」。**这不是 bug，是没声明。**
 
-本仓库提供 8 个零依赖的 Node 脚本 + 9 个共享库，做四件事：
+本仓库提供 8 个零依赖的 Node 脚本 + 10 个共享库，做四件事：
 
 1. **测**——用真实（便宜的）请求测出这个端点到底有什么能力；
 2. **验**——不启动 DSH，直接让 `dsh-llm-pi-ai` 的校验路径解析你写的 YAML，并顺带算压缩联动数字；
 3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效；
 4. **上线后对账 + 自动修正**——从真实会话记录里查「声明 vs 实际」，按探针结果重算并安全改写，全程留 JSONL 日志（含「上次为什么失败」）。
+
+> **v0.4.0**（第四轮外部评审的核验与修复）：评审提了 4 个逻辑漏洞 + 4 处文档矛盾，逐条核验后 **3 条成立、1 条部分成立、1 条不成立（已实测反驳）**：
+>
+> - ✅ **成立**：`verify-effective` 的判据被拔高成「能抓网关偷换窗口」——实际上 `request/context` 里的 `contextWindow` 是 **DSH 本地声明值，不是网关回报**，那个检查只能证明「HMR 没生效 / 被别的层覆盖」。现在文案改准，并新增**唯一能证伪大窗口的运行时铁证**：发生 context-overflow 且报错前最大单轮输入 **小于** 声明窗口。
+> - ✅ **成立**：单轮 `inputTokens ≥ 压缩阈值` 被当成矛盾（exit 1）会误报正常长会话；降级为 warning（压缩在**下一轮**才触发），只有 `≥ 可用消息预算 ctx-maxTokens` 仍算矛盾。
+> - ✅ **成立**：挂起图片会跨模型污染（本地 `UNSUPPORTED_CONTENT` 拦下后换模型重发）；现在换模型、出错、会话边界都清空挂起队列。
+> - ◐ **部分成立**：qwen 格式下 `supportsReasoningEffort` 的两难（百炼只认 `enable_thinking`/`thinking_budget`，顶层 `reasoning_effort` 可能被静默忽略）——新增两条审计警告 `qwen-effort-may-be-ignored`、`thinking-no-off-level`；档位判定改为 **每档 2 次采样取中位数 + high ≥ 2×low 且差 ≥16 token**，避免把采样噪声当成能力（新增 `--no-effort-levels`）。
+> - ❌ **不成立（实测反驳）**：`repair --apply` 会抹掉 `headers`/`retryPolicy`/`timeoutMs`/`thinkingBudgets`/`transport` —— 实测这些字段**全部原样保留**（`renderRouteYaml` 是整对象 `YAML.stringify`），并补了组 22 回归测试锁死。
+> - ✅ **成立**：窗口探测把 413/429/超时当成「撞上窗口上限」——新增 `lib/probe-heuristics.mjs` 的 `classifyWindowStop()`，只有 `context-overflow` 才认边界，网关限制时报「只能证明至少这么大」。
+>
+> 文档侧 4 处自相矛盾也一并改了（`headroomTokens: 0` 的准确表述、§2.7/§3.5 残留的单向探测文案、`defaultMaxTokens` 建议值 65536 → 32768、附录 B 退出码与 §3.3 失步）。测试 95 → **101 条（22 组，0 skip）**。
 
 > **v0.3.9**（第三轮三个子代理审计后的修复）：①**P0**——compaction 配置不符合插件加载规则时，所有工具仍打 ✓ 连 `--apply` 也写进去，现在新增 `validateCompactionConfig()` 在 7 个入口先拒、一个字节不写；②`repair` 多路由只真改一条却报「已修正 3 个模型」（stale 行数组），现在同数组降序替换并断言行数；③`repair` 对 BOM 文件恒判「被并发修改」、空 probe 时凭空写 `maxTokens`、`--route` 把同路由别的模型一起改——都已修；④写盘改成「先整份预验、再原子写」，思考声明统一走 `thinkingFromProbe()`；⑤`verify-effective` 按时间升序、图片归属修正；⑥context-budget 非整数参数 exit 2、gap 只警告。测试 87 → **95 条（21 组，0 skip）**。
 >
