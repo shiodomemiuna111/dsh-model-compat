@@ -473,7 +473,7 @@ ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
 | 16 | 2 | **verify-effective**：用 `zstd` 造真实格式的会话文件，断言抓到「运行时 ctx=131072 但声明 1e6」「inputTokens 越过压缩阈值」「发过图但没声明 image」「context_length_exceeded 归并」；没有该模型时只标「未使用」不报错 |
 | 17 | 2 | **repair**：dry-run 不写盘且给出逐字段 diff；`--apply` 后文件真被改、留备份、写后复验通过、日志里既有 `change` 也有带「写后校验」阶段的 `attempt`；再跑一次「不需要修正」；窗口太小无法算出合法 maxTokens 时拒绝写盘 exit 1 |
 | 18 | 1 | **runlog**：同一尝试键先失败后成功，第二次记录自动带 `prevFailureId` + 人读的 `prevFailure` |
-| 19 | 3 | **`--help` 与实现双向对账（v0.3.8）**：`lib/usage.mjs` 的键必须与 `scripts/` 一一对应；每个脚本「源码里真实解析的 `--flag`」与「usage 文本里的 flag」双向 diff，漏写/多写都红 |
+| 19 | 1 | **`--help` 与实现双向对账（v0.3.8）**：`lib/usage.mjs` 的键必须与 `scripts/` 一一对应；每个脚本「源码里真实解析的 `--flag`」与「usage 文本里的 flag」双向 diff，漏写/多写都红 |
 | 20 | 3 | **compaction 对齐真插件（v0.3.8）**：policy `retainRatio` 压过全局 `retainTokens`（旧版工具绿、真插件抛）、`headroomTokens:0` 是硬失败（插件 `assertPositiveInteger`）、`gap` 不足只算 warning（`ok` 仍为 true） |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
