@@ -1,6 +1,6 @@
 # 第三方模型能力声明方案 · 规格书
 
-**版本**：0.2.2 ｜ **代码提交**：`c40c267`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
+**版本**：0.3.0 ｜ **代码提交**：`__COMMIT__`（仓库 `master` 持续更新，本文以该提交为准） ｜ **仓库**：<https://github.com/shiodomemiuna111/dsh-model-compat> ｜ **许可证**：MIT
 
 **写这份文档的目的**：把方案讲清楚到「别人可以照着实现、也可以照着挑错」的程度，用于外部评审。
 本文所有结论都标注来源：**【读码】** = 读了哪个文件哪几行；**【实测】** = 跑了哪条命令、输出了什么；**【未验】** = 没验证，明确标出来。
@@ -31,7 +31,7 @@ DSH 的模型目录是静态的。你接一个目录里没有的第三方 OpenAI
                                                 ↘ 跨版本复验（同一份 YAML 丢给 5 个历史版本）
 ```
 
-产出是 6 个零依赖脚本 + 5 个共享库 + 一份可直接抄的声明模板 + 47 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
+产出是 6 个零依赖脚本 + 7 个共享库 + 一份可直接抄的声明模板 + 63 条回归测试。**核心主张只有一条：声明必须由证据支撑，而证据必须能复现。**
 
 ---
 
@@ -148,18 +148,23 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 
 **工程后果 1（最重要的坑）**：`contextWindow: 131072` + 继承的 `maxTokens: 128000` → `B = 3072` → `pressure = -62464` → **启动即抛错**。所以「窗口按真实值填、但不动 maxTokens」这条路是走不通的，必须**同时**把 `maxTokens` 显式下调。
 
+> **v0.3.0 勘误（外部评审抓到的数据硬伤）**：0.2.2 版这张表把 `131072 / 128000` 与 `threshold=12484 / retain=12483 / gap=1` 写在同一行，**是错的**——那组数对应的是 `ctx=206020, maxTokens=128000`。`131072 / 128000` 根本走不到算 threshold：它在 `pressure<=0`（`:131`）就抛了。现在两行分开写，并且第一行明确标注「不是抖动，是直接失败」。
+
 **工程后果 2**：即使不抛错，`threshold - retain` 太小会导致「压缩完立刻又到阈值」的抖动。本仓库建议 `>= 30000`（工程经验值，不是 DSH 强制）。示例数字：
 
-| ctx | maxTokens | threshold | retain | gap |
+| ctx | maxTokens | threshold | retain | gap | 判定 |
 |---|---|---|---|---|
-| 131072 | 128000 | 12484 | 12483 | **1**（必然抖动） |
-| 131072 | 16384 | 49152 | 18350 | 30802 |
+| 131072 | 128000 | — | — | — | **硬失败**（`pressure=-62464`，不是抖动） |
+| 206020 | 128000 | 12484 | 12483 | **1** | **必然抖动**（这正是 198k 反而比 128k 更危险的原因） |
+| 131072 | 16384 | 49152 | 18350 | 30802 | 通过 |
 | 131072 | 8192 | 57344 | 19660 | 37684 |
 | 262144 | 32768 | 163840 | 36700 | 127140 |
 | 400000 | 65536 | 268928 | 53514 | 215414 |
 | 800000 | 65536 | 640000 | 117514 | 522486 |
 
-（以上六行是 【实测】：`node scripts/context-budget.mjs --ctx … --max … --json`。）
+（以上各行是 【实测】：`node scripts/context-budget.mjs --ctx … --max … --json`。）
+
+**工程后果 2b（v0.3.0 新增）**：安全取值的下限不是「能加载」，而是「`gap >= 30000`」。给定 `headroom`，`B_min = floor(minGap / (1 - retainRatio)) = floor(30000 / 0.84) = 35715`（`retain < threshold - 30000` 的解），所以 `contextWindow > maxTokens + headroom + 35715`。
 
 **工程后果 3**：`headroomTokens` 是公开配置键（`:63` 读取，`:103` 支持 per-target 覆盖），不是硬编码常量。把 65536 调到 16384，可以让 64k 窗口的模型也能加载（反推公式：`contextWindow > maxTokens + headroomTokens`）。
 
@@ -285,70 +290,84 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | `merge-routes.mjs` | 批量导入路由，单条失败不拖累全局 | `--patch` `--from`（可重复，必填）、`--plugin`/`--plugin-root`、`--dry-run`、`--replace`、`--no-verify` | 0 有写入或已是最新；1 没有可写入条目/复验失败（已回滚）；2 用法错误 | 不花钱 |
 | `probe-matrix.mjs` | 跨版本沙箱复验同一份 YAML | `--patch`、`--versions a,b`、`--work DIR`、`--dsh-root`、`--keep` | 0 全通过且一致；非 0 有版本失败 | 不花钱（只装 npm 包） |
 
-**`probe-capabilities.mjs` 的七个探测项与判据**（每个都对应一个声明字段）：
+**`probe-capabilities.mjs` 的七个探测项与判据（v0.3.0 全部重写）**：
 
-| # | 探测 | 决定了 | 判据 | 成本 |
+| # | 探测 | 决定了 | 判据（v0.3.0） | 成本 |
 |---|---|---|---|---|
 | 1 | `GET /models` 是否含该模型 | 能否用目录路由 | 200 且 id 命中 | 免费 |
-| 2 | 基础 chat | key / baseURL / 协议通不通 | 200 且 content 非空 | ~20 token |
-| 3 | `max_tokens=400000` | `maxTokens` 能写多大 | 200 = 接受 393216 | ~20 token |
-| 4 | 三种「关思考」写法 | `thinkingFormat` 选哪个 | 只有把 `usage.completion_tokens_details.reasoning_tokens` **归零**的写法才算 | 每次 ~30 token |
-| 5 | 1×1 PNG | `input` 要不要加 `image` | 200 且（有回答 或 `prompt_tokens` 明显上涨） | ~20 token |
+| 2 | 基础 chat | key / baseURL / 协议通不通 | 200 且 content 非空（空则加大 max_tokens 重试一次） | ~20 token |
+| 3 | `max_tokens` **阶梯下探** | `maxTokens` 或网关输出上限 `gateMaxTokens` | 从 65536 起 65536→49152→32768→24576→16384→12288→8192→4096 逐档试，取**第一个 200** 的档位；全拒则标注「测不出」 | 每档 ~20 token |
+| 4 | 思考 **双向**探测 | `reasoningEfforts` / `thinkingFormat` / 有没有 `off` 档 | 先测 baseline 判 `defaultOn`；默认开→试三种关法（`enable_thinking:false` / `thinking:{type:"disabled"}` / `reasoning_effort:"none"`），能归零才 `canDisable`；默认关→试三种开法，能出 reasoning 才 `canEnable`；`reasoning` 判据同时看 `usage.completion_tokens_details.reasoning_tokens`、`.reasoning===true`、`choices[0].message.reasoning_content` | 每次 ~30 token |
+| 5 | **32×32 纯红 PNG** + 问颜色 | `input` 要不要加 `image` | **必须答出 red**（`/\bred\b|红/i`）；答 blue/绿/「看不到」或空都判 `vision=false`（模拟静默丢图） | ~20 token |
 | 6 | 流式 SSE | UI 能否显示思考过程 | `delta` 里有没有 `reasoning_content` | ~30 token |
 | 7 | 固定阶梯窗口探测（**默认关闭**） | `contextWindow` | 1M/2M/4M/8M 字符递进，取最大成功那次的 `prompt_tokens × 0.95`、向下取整到 4096 的倍数 → **安全下界**，不是精确阈值 | 几十万 token |
 
-### 3.4 五个共享库
+> v0.3.0 修的三处判据漏洞：旧版「输出上限」只发一次 `max_tokens=400000`（多数网关直接 400，测出来的是「不支持 400k」而不是上限）；旧版视觉判据 `200 && (有回答 || prompt_tokens>20)` 里「有回答」恒真（静默丢图的网关全放行）；旧版思考只测「怎么关」（默认关闭的模型会被误判成不可调）。
+
+### 3.4 七个共享库
 
 | 库 | 导出 | 职责 |
 |---|---|---|
-| `lib/schema-keys.mjs` | `ROUTE_KEYS` `MODEL_KEYS` `ROUTE_ONLY_MODEL_KEYS` `COMPAT_KEYS` `THINKING_FORMATS` `MODALITIES` `THINKING_LEVELS` | 与源码对齐的权威字段清单（测试组 3 会拿源码比对，源码变了就红） |
-| `lib/audit.mjs` | `staticAudit(providers) → {level,code,msg}[]` | 不启动 DSH 的静态审计：未知字段、拼写提示、null 值、只在路由层生效的字段写进模型层、兜底值提醒等 |
-| `lib/load-path.mjs` | `verifyLoadPath(pluginRoot, providers, mode) → {schema, semantic, routes}` | 把插件入口复制成临时探针，补一行 `export { resolveProfiles }`，**两段都跑**；正常/信号退出都删探针 |
-| `lib/yaml-edit.mjs` | `locateProviders` `removeRouteBlock` `renderRouteYaml` `renderManagedBlock` `findManagedBlock` | 在保留注释与格式的前提下增删 providers 条目；**缩进从目标文件探测**，不写死 |
-| `lib/snippet.mjs` | `buildSnippet(...)` `UNMEASURED_CONTEXT_WINDOW = 200000` | 证据 → 可粘贴 YAML 片段的唯一出口（「没证据就不写」规则集中在这里） |
+| `lib/schema-keys.mjs` | `ROUTE_KEYS` `MODEL_KEYS` `ROUTE_ONLY_MODEL_KEYS` `COMPAT_KEYS` `THINKING_FORMATS` `MODALITIES` `THINKING_LEVELS` | 与源码对齐的权威字段清单（测试组 3 会拿源码比对，源码变了就红）。v0.3.0 补上漏掉的 `thinkingBudgets`（源码 `index.js:1063`） |
+| `lib/audit.mjs` | `staticAudit(providers) → {level,code,msg}[]` | 不启动 DSH 的静态审计；v0.3.0 新增 3 条「两层都放行但序列化失效」：`thinking-format-without-efforts`、`thinking-budget-without-map`、`qwen-levels-may-collapse` |
+| `lib/compaction.mjs` | `computeBudget` `reservedCompletionTokensOf` `compactionConfigFromPatch` `policyForRoute` `pickSafeMaxTokens` `minContextWindowFor` `MAX_TOKENS_LADDER` | **压缩公式的唯一副本**（照 `resolveCompactSpec` 抄），被 context-budget、load-path 第 3 段、snippet 三处复用 |
+| `lib/load-path.mjs` | `verifyLoadPath(pluginRoot, providers, mode, options) → {schema, semantic, budget, routes}` | 把插件入口复制成**临时目录里的探针**（不写进 node_modules），补 `export { resolveProfiles }`，跑**三段**：Config → resolveProfiles → 压缩预算 |
+| `lib/fs-safe.mjs` | `resolveWriteTarget` `atomicWriteFile` `backupFile` `rollbackFrom` | realpath 跟随软链、同目录临时文件 + 校验 + `rename` 原子替换、带时间戳备份与回滚 |
+| `lib/yaml-edit.mjs` | `locateProviders` `removeRouteBlock` `renderRouteYaml` `renderManagedBlock` `findManagedBlock` | 保留注释与格式地增删 providers 条目；缩进从目标文件探测 |
+| `lib/snippet.mjs` | `buildSnippet(...) → {yaml, chosenMaxTokens, budget, notes}` | 证据 → YAML 片段的唯一出口；`maxTokens` 由 `pickSafeMaxTokens` 反推，不再硬编码 65536 |
 
 ### 3.5 声明决策表（写什么、为什么）
 
 | YAML 字段 | 证据从哪来 | 写错的后果 | 本方案的规则 |
 |---|---|---|---|
 | `contextWindow` | 真实窗口测试（`--window`）或厂商文档 | 写大 → 压缩不触发，靠 400 兜底；写小 → 提前压缩 | 填**实测**值；没测就写 200000 占位并加警告注释（**不写 1e6**） |
-| `maxTokens` | `max_tokens=400000` 探测 | 写太大 → `pressure<=0` 启动失败、或网关 400；写小 → 单次回复短 | 故意写 32768~65536（推荐 65536） |
-| `input` | 1×1 PNG 探测 | 少写 `image` → 本地硬拦；多写 → 上游 400 | 只加**测过**的模态；默认 `[text]` |
-| `reasoningEfforts` | 三种关思考写法的对比 | 不写 → 选择器没档位；写错 → 无效 | 只声明**实测可复现**的档位；没有证据就 `reasoningEfforts: false` |
+| `maxTokens` | `max_tokens` **阶梯下探**得到的 `gateMaxTokens` | 写太大 → `pressure<=0` 启动失败、或网关 400；写小 → 单次回复短 | 取 `min(gateMaxTokens, floor(ctx×0.2))` 并在阶梯里选第一个满足 `gap>=30000` 的值（由 `pickSafeMaxTokens` 反推；ctx=131072 时结果是 16384，不是 65536） |
+| `input` | 32×32 纯红 PNG + 问颜色（必须答 red） | 少写 `image` → 本地硬拦；多写 → 上游 400 | 只加**测过**的模态；默认 `[text]` |
+| `reasoningEfforts` | 双向探测（默认开→测关；默认关→测开） | 不写 → 选择器没档位；写错 → 无效；给纯推理模型写 `off` → 用户点了没用/被拒 | 只声明**实测可复现**的档位；`off` **只在实测能关掉思考时写**；没有证据就 `reasoningEfforts: false` |
 | `compat.thinkingFormat` | 同上（哪个写法真能归零） | 写错 → 静默失效 | **只有探测到才写**；探测不到**整块 `compat` 都不写** |
 | `defaultInput` / `defaultMaxTokens` | —（路由级兜底） | 不写 → 落 1e6 / 128000 | 建议显式写 `[text]` / `65536` |
 | 路由名 | — | 用目录已有 id 会继承目录属性（可能跨协议污染）；未命中则等价手写路由 | 走 OpenAI 兼容反代时统一新建 `custom-*` |
 
-### 3.6 片段生成规则（这里修过两个真 bug）
+### 3.6 片段生成规则（修过四个真 bug）
 
-旧版把 YAML 模板内联在 `probe-capabilities.mjs` 里，产出的片段有两个真问题（**【实测】** 由「照文档真敲」审计发现）：
+旧版把 YAML 模板内联在 `probe-capabilities.mjs` 里，产出的片段有四个真问题（前两个由「照文档真敲」审计发现，后两个由外部评审指出）：
 
 1. 探测不到思考开关时，旧版输出 `thinkingFormat: null` → 真实解析报 `sets compat "thinkingFormat" with no value`，**整份配置被拒**；
-2. 没测窗口时，旧版输出 `contextWindow: 1000000` → 正是本方案反对的「抄兜底值」。
+2. 没测窗口时，旧版输出 `contextWindow: 1000000` → 正是本方案反对的「抄兜底值」；
+3. `maxTokens` 硬编码 65536 → 在 `ctx=131072` 下 `pressure=0`，**启动即抛**；
+4. `reasoningEfforts` 硬编码 `off/low/high` → 遇到关不掉思考的模型会写一个无效的 `off` 档。
 
-现在的规则（集中在 `lib/snippet.mjs`）：
+现在的规则（集中在 `lib/snippet.mjs`，返回 `{yaml, chosenMaxTokens, budget, notes}`）：
 
 - **没有思考证据 → 完全不写 `compat` 块**；
-- **没测窗口 → 写 `200000` + `# ⚠ contextWindow 没测…保守占位` 注释**（200000 在 `maxTokens=65536` 时仍满足 `pressure>0` 与 `gap>=30000`）。
+- **没测窗口 → 写 `200000` + `# ⚠ contextWindow 没测…保守占位` 注释**；
+- **`maxTokens` 由预算反推**：`≤ min(gateMaxTokens, floor(ctx×0.2))`，且必须 `gap>=30000`；ctx=131072 时自动落到 **16384**（budget 输出 `pressure=49152 retain=18350 gap=30802`）；
+- **`off` 档只在 `canDisable` 时写**；纯推理模型只写 `high: "high"`；多档只在两个方向都测出差异时给；
+- **`notes[]` 把「为什么这么写」一并打出来**（例如「网关实测上限 65536，但按 ctx×0.2 与压缩预算只推荐 16384」）。
 
-两种形态都跑过两段校验（**【实测】**）：
+实测（**【实测】**，测试组 9 + mock 组 11）：
 
 ```
-无证据片段：ctx=200000 max=65536 input=[text]  reasoning=false            threshold=68928  retain=21514  gap=47414
-有证据片段：ctx=400000 max=65536 input=[text,image] levels=low/high qwen   threshold=268928 retain=53514 gap=215414
+无证据片段：ctx=200000 max=32768 input=[text]           reasoningEfforts: false   gap=74939
+有证据片段：ctx=400000 max=65536 input=[text,image]      off/low/high  qwen       gap=215414
+ctx=131072：maxTokens 自动从 65536 下调到 16384（65536 会 pressure=0）
+纯推理：只写 high: "high"，不写 off
 ```
 
 ### 3.7 安全写入模型
 
 `inject-model.mjs` 与 `merge-routes.mjs` 共用同一套写盘纪律：
 
-1. **写前隔离预演**：先在临时目录里对「将要写入的内容」跑 strict 两段校验；不过就不写（`inject-model`）。
+1. **写前隔离预演**：先在临时目录里对「将要写入的内容」跑三段校验（Config → resolveProfiles → 压缩预算）；不过就不写（`inject-model` 可用 `--force` 绕过，`merge-routes` 不行）。
 2. **最小文本插入**：保留原文件注释与格式，只插/删必要行；**缩进从目标文件探测**（`locateProviders`），不假设 2 空格或 6 空格。
 3. **托管块**：`merge-routes` 只改自己维护的区间（`# >>> managed-by-dsh-model-compat` … `# <<< managed-by-dsh-model-compat`），块外手写路由**永不改动**；标记只认「行首 + 全行匹配」，避免文件头部注释里提到标记就误判。
 4. **备份**：`<file>.bak-<UTC 时间戳>`（`merge-routes` 额外带 `-<毫秒>`），同一时间戳冲突自动加 `-1`、`-2`。
 5. **写后复验 + 回滚**：写盘 → 重新解析 → 校验托管块内路由；失败则从备份恢复并 exit 1。
 6. **拒绝破坏性操作**：源与目标同一文件、多个 `- id: llm-pi-ai` 条目、目标文件读不到/是目录、**源文件全坏**（此时重渲染会把托管块清空 → 静默删掉线上路由）——统统拒绝并说明原因，exit 1，不改文件。
-7. **探针清理**：临时探针文件在 `finally` 与 `SIGINT/SIGTERM/SIGHUP` 钩子里删除。
+7. **探针不写进 node_modules（v0.3.0）**：探针改成 `mkdtempSync(tmpdir())` 下的独立包（`index.mjs` + `package.json{"type":"module"}` + 软链 `node_modules`），只读安装目录也能用，并发不再互删；`SIGINT/SIGTERM/SIGHUP/exit` 都清理（`SIGKILL` 无法捕获）。
+8. **原子写（v0.3.0）**：先写同目录隐藏临时文件 `.<name>.tmp-<pid>-<ts>` → 可选 `check()` 校验（`YAML.parse` + `providers` 还在）→ `renameSync` 原子替换。这样即使被 `dsh-hmr` 监听（`dsh-hmr/lib/index.js:850`），也不会读到半截文件。
+9. **软链（v0.3.0）**：写之前 `realpathSync` 解析；如果目标是指向别处的软链，写真实文件并保留软链，不会把软链替换成普通文件。
+10. **第 3 段预算校验（v0.3.0）**：`inject-model` / `merge-routes` / `resolve-check` 写前都会跑 `computeBudget`，不过就拒绝（`inject-model` 可用 `--force` 绕过，`merge-routes` 无绕过）。
 
 ### 3.8 跨版本矩阵
 
@@ -372,7 +391,7 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | 4 | `node scripts/probe-matrix.mjs --patch …` | **5/5 版本 PASS**，4 字段一致 | 2026-11-09 |
 | 5 | 红跑（旧代码 `cb11b4a` + 新测试） | 组 8 五条 **5/5 fail** | 2026-11-09 |
 
-### 4.2 47 条测试的分组
+### 4.2 63 条测试的分组
 
 | 组 | 条数 | 覆盖什么 |
 |---|---|---|
@@ -384,7 +403,9 @@ retain    = floor(B * 0.16)                             // :17 = .16, :133
 | 6 | 3 | 自我合并拒绝、重名冲突、`--replace` |
 | 7 | 4 | 「照文档敲就跑不转」的 4 个 CLI bug（G–J） |
 | 8 | 5 | 第二轮对抗审计的静默破坏（缩进假设、重复条目、缺字段、兄弟路由、SIGTERM） |
-| 9 | 4 | `--yaml` 片段生成（含对旧模板的反证） |
+| 9 | 7 | `--yaml` 片段生成（无证据 / 占位窗口 / maxTokens 反推 / 纯推理不写 off / 两形态过三段 / 旧模板反证） |
+| 10 | 9 | v0.3.0：第 3 段压缩预算红绿、fs-safe 原子写与软链、`context-budget --patch`、3 条新审计规则、`thinkingBudgets` 不误报 |
+| 11 | 4 | **mock 网关**：静默丢图→vision=false、真答红→vision=true、`max_tokens>16384` 全 400→gateMaxTokens 收敛、默认关思考→canEnable + qwen |
 
 **测试原则**：每条都对应一个真实审计提出的 bug；修完必须同时有「旧代码红 / 新代码绿」的证据（红跑见 §4.1 #5），不是「跑通了就算」。
 
@@ -412,7 +433,14 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 ✓ custom-modelscope-2 / deepseek-ai/DeepSeek-V4.1-Flash-1017  （同上）
 ✓ custom-apizn / gpt-6.1-sol                       ctx=800000  max=65536  input=[text,image] reasoning=true levels=low/high
 静态审计：未发现 strict 放行的问题写法。
+压缩联动（headroom=65536）：
+  ✓ custom-111: threshold=541248 retain=97085 gap=444163
+  ✓ custom-dashscope-aliyuncs: threshold=800000 retain=149514 gap=650486
+  ✓ custom-modelscope-1/2: threshold=672320 retain=118056 gap=554264
+  ✓ custom-apizn: threshold=640000 retain=117514 gap=522486
 ```
+
+**关于「4 条 ctx=1000000 为什么能过 lint」**（评审 Q&A 里问的）：它们过的是**结构性检查**——三段校验只证明「按你声明的数字算，配置能被加载、压缩不会自相矛盾」，不证明 `1000000` 是这家端点的真实窗口。这四条里的 `1000000` 是**显式写死的**（不是落默认值，所以审计不会报 `default-context-window`），但它们**没有跑过 `--window` 实测**，属于【未验】。真要坐实，得对每个端点跑一次 `probe-capabilities --window`。这也是本方案「声明必须由证据支撑」的自我打脸之处：**本机这份 profile 里就有 4 条未经证据的声明**。
 
 ### 4.5 跨版本（**【实测】** 2026-11-09）
 
@@ -451,15 +479,16 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 诚实清单，按「影响程度」排序：
 
 1. **窗口探测不是精确值**：固定阶梯（1M/2M/4M/8M 字符）+ `prompt_tokens × 0.95` 取整到 4096 的倍数，得到的是**安全下界**。真实阈值可能更高，也可能因输入内容（中文/代码）而不同。
-2. **模态与思考档位无法自动证明**：只能靠一次真实请求。「上游静默丢图」和「声明错」表现一样，本仓库无法区分——只能通过对比 `prompt_tokens` / 实际回答来判断，且不 100% 可靠。
+2. **模态与思考档位无法自动证明**：只能靠真实请求的**行为差异**判断。v0.3.0 把判据收紧到「必须答出红色」「必须出现 reasoning 信号」，并用 mock 网关覆盖了「静默丢图」「默认关思考」两种坏网关（组 11）；但真实网关的怪行为（例如图像被压缩到模糊、reasoning 只偶尔出现）仍可能误判。
 3. **预算检查是算术，不是真值**：`resolve-check --budget` 只能保证「按你声明的数字算，压缩不会自相矛盾」，**不能**保证「你声明的数字是真的」。数字造假时它会一路 ✓（示例：`ctx=1e6 max=128000` → threshold 800000 / gap 660480，全绿——但真实窗口 128k 时这套声明是错的）。
-4. **`SIGKILL` 时探针文件可能残留**：`lib/load-path.mjs` 用 `process.on("exit"|"SIGINT"|"SIGTERM"|"SIGHUP")` 清理，SIGKILL 无法捕获。残留文件是 `lib/__loadpath-probe.mjs`，删掉即可，不影响 node_modules 原文件。
+4. **`SIGKILL` 时临时探针目录可能残留（v0.3.0 起位置变了）**：探针不再写进 `node_modules`，而是在系统临时目录下（`dsh-loadpath-*`）；`SIGKILL` 无法捕获，残留的只是临时目录，不影响 DSH 安装。
 5. **`--replace` 删除旧条目时，紧邻的注释会留在原地**（不破坏 YAML，但不整洁）。
 6. **跨版本沙箱是「近似环境」**：它把目标版本的插件 + 匹配的 `pi-ai` 装进 `/tmp`，其余 `@deepseek-ai/*` 用本机版本的 symlink。所以它验证的是「插件版本差异」，不是「整套 DSH 版本差异」。
 7. **未覆盖**：`cost` / `promptCache` / `modelOverrides` 的自动生成、工具调用能力、图片细节等级、`headers` / `retryPolicy` 的推荐值——这些目前仍是手写。
 8. **平台**：只在 Linux（Android proot / aarch64）验证；macOS / Windows 的路径分隔符与权限差异未测（脚本用的是 `node:path`，理论上没问题，但**未验**）。
-9. **`--window` 会真的花钱**：默认关闭，文档里也标了成本；本仓库所有实测都没跑过它（**未验**真实端点上的表现，只用 mock 验证过流程）。
-10. **`dsh --profile web --dump-config` 不做校验**：它是打印配置，不是校验入口（**【实测】** 塞 `compat.thinkingFormat: bogus` + `contextWindow: "not-a-number"` 仍 exit 0）。所以别拿它当验证手段——用 `resolve-check`。
+9. **`--window` 会真的花钱**：默认关闭，文档里也标了成本；本仓库所有实测都没跑过它（**未验**真实端点上的表现）。
+10. **同一厂商的「思考」语义可能不同**：`enable_thinking` / `thinking.type` / `reasoning_effort` 三种写法在不同网关下含义不同（例如有的 `reasoning_effort` 只影响「思考预算」不影响开关）。探测只能证明「这个写法在这家端点上改变了行为」，不能证明「厂商文档说的是同一件事」。
+11. **`dsh --profile web --dump-config` 不做校验**：它是打印配置，不是校验入口（**【实测】** 塞 `compat.thinkingFormat: bogus` + `contextWindow: "not-a-number"` 仍 exit 0）。所以别拿它当验证手段——用 `resolve-check`。
 
 ---
 
@@ -469,7 +498,7 @@ $ cd /tmp/red8 && node --test --test-name-pattern="4 空格缩进|多个 - id|pr
 
 ```bash
 git clone https://github.com/shiodomemiuna111/dsh-model-compat && cd dsh-model-compat
-npm test                                   # 47 条回归
+npm test                                   # 63 条回归
 npm run selfcheck                          # 测试 + 示例配置两段校验 + 预算
 node scripts/context-budget.mjs --ctx 131072 --max 128000   # 看「为什么会失败」
 ```
@@ -521,7 +550,7 @@ node scripts/probe-matrix.mjs --patch examples/cordis.patch.yml
 4. **§3.5 的保守取值（`maxTokens` 32768~65536、`contextWindow` 填实测值）** 在大窗口（≥1M）模型上是否会带来不可接受的提前压缩？有没有更优的 headroom/thresholdRatio 组合？
 5. **§3.6 的「没证据就不写 compat」是否过于保守？** 有没有「不写 compat 就一定错」的协议（例如某些网关必须显式 `enable_thinking` 才开思考）？
 6. **§3.7 的写盘纪律** 还有哪些破坏场景没覆盖？（我已知：SIGKILL 残留、`--replace` 注释残留、并发两个进程同时写同一文件未加锁。）
-7. **§4 的证据强度**：47 条测试 + 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
+7. **§4 的证据强度**：63 条测试 + 5 个版本矩阵，够不够支撑「方案可用」？还缺哪一类测试（例如真实 DSH 启动后的端到端会话测试——我目前只做到「不启动 DSH 的等价校验」）？
 8. **§5 的边界**里，哪一条在你看来是「必须修才能交付」，哪一条可以接受为已知限制？
 
 ---

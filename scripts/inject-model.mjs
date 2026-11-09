@@ -19,11 +19,13 @@
  *
  * 退出码：0 写入成功（或者 dry-run 校验通过）；1 校验失败/拒绝写入；2 用法错误
  */
-import { readFileSync, writeFileSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { locateProviders, removeRouteBlock, renderRouteYaml } from "../lib/yaml-edit.mjs";
+import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
+import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom } from "../lib/fs-safe.mjs";
 
 const require = createRequire(import.meta.url);
 const argv = process.argv.slice(2);
@@ -108,20 +110,23 @@ const compat = fmt
   ? { thinkingFormat: fmt, ...(effortProven ? { supportsReasoningEffort: true } : {}) }
   : null;
 
-// 压缩联动自检：不允许写一条注定被拒的声明
-const B = ctx - maxTokens;
-const pressure = B - o.headroom;
-const threshold = Math.floor(Math.min(0.8 * ctx, pressure));
-const retain = Math.floor(B * 0.16);
-const problems = [];
-if (pressure <= 0) problems.push(`ctx ${ctx} 太小：pressure=${pressure} ≤ 0（至少要 ctx > ${maxTokens + o.headroom + 1}）`);
-if (retain >= threshold) problems.push(`retain ${retain} ≥ threshold ${threshold}`);
-if (threshold - retain < 30000) problems.push(`缓冲带 ${threshold - retain} < 30000，会压缩抖动`);
-if (problems.length && !o.force) {
-  console.error("拒绝写入，这条声明会让 DSH 启动失败或抖动：");
-  for (const p of problems) console.error("  ✗ " + p);
-  console.error("用一个更小的 --max（或更大的窗口）再试，或加 --force 强行写入。");
-  process.exit(1);
+// 压缩联动自检：三个数字（ctx / maxTokens / headroom）必须过 dsh-compaction-basic 的硬约束。
+// 公式来自 lib/compaction.mjs（唯一副本）；具体 headroom 在读到目标 patch 里的
+// compaction-basic 配置后才能确定（可能被 headroomTokens / modelPolicies 覆盖）。
+function budgetCheck(compactionCfg) {
+  const policy = policyForRoute(
+    compactionCfg ?? { headroomTokens: o.headroom, thresholdRatio: 0.8, retainRatio: 0.16, retainTokens: null, modelPolicies: [] },
+    o.route,
+    modelId,
+  );
+  return computeBudget({
+    contextWindow: ctx,
+    reservedCompletionTokens: maxTokens,
+    headroomTokens: o.headroom ?? policy.headroomTokens,
+    thresholdRatio: policy.thresholdRatio,
+    retainRatio: policy.retainRatio,
+    retainTokens: policy.retainTokens,
+  });
 }
 
 // api：探测脚本只会说 OpenAI 兼容协议（它自己就是按 /chat/completions 打的），
@@ -168,6 +173,16 @@ if (!entry) { console.error("补丁里没有 - id: llm-pi-ai 条目，请先按 
 const providers = entry.config?.providers ?? {};
 if (providers[o.route]) console.error(`警告：路由 ${o.route} 已存在，将被文本替换覆盖`);
 
+// 第 3 段：压缩预算（用目标文件里 compaction-basic 的真实 headroom/modelPolicies）
+const compactionCfg = compactionConfigFromPatch(doc);
+const budget = budgetCheck(compactionCfg);
+if (!budget.ok && !o.force) {
+  console.error("拒绝写入，这条声明会让 DSH 启动失败或抖动：");
+  for (const p of budget.problems) console.error("  ✗ " + p);
+  console.error("用一个更小的 --max（或更大的窗口）再试，或加 --force 强行写入。");
+  process.exit(1);
+}
+
 // ── 预演：在临时目录里合并校验（不碰真实文件）
 const merged = structuredClone(doc);
 const mEntry = merged.find((e) => e?.id === "llm-pi-ai");
@@ -204,31 +219,44 @@ if (o.dryRun) {
 }
 
 // ── 真正的文本插入：插在 llm-pi-ai 的 providers: 之后（保留注释与格式）
-const stamp = new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+/, "");
-let bak = `${o.patch}.bak-${stamp}`;
-for (let n = 1; existsSync(bak); n++) bak = `${o.patch}.bak-${stamp}-${n}`;
-copyFileSync(o.patch, bak);
 const cur = text.split("\n");
 let at;
 try { at = locateProviders(cur); }
 catch (e) { console.error(`${String(e?.message ?? e)}（文件未改）`); process.exit(1); }
 const updated = [...cur.slice(0, at.line + 1), ...block.split("\n").slice(0, -1), ...cur.slice(at.line + 1)].join("\n");
-writeFileSync(o.patch, updated);
+
+// 软链先解析（避免把 dotfiles 软链替换成普通文件），写入走「临时文件 + rename」原子替换
+// （cordis.patch.yml 被 dsh-hmr 监听，半截文件会触发一次失败的配置重载）。
+const { target: realTarget, viaSymlink } = resolveWriteTarget(o.patch);
+if (viaSymlink) console.error(`注意：${o.patch} 是软链，实际写入 ${realTarget}。`);
+let bak;
+try { bak = backupFile(o.patch, new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+/, "")); }
+catch (e) { console.error(`无法创建备份：${String(e?.message ?? e)}（目录只读？）未改动文件。`); process.exit(1); }
+try {
+  atomicWriteFile(realTarget, updated, {
+    check: (t) => { YAML.parse(t); },
+  });
+} catch (e) {
+  try { rollbackFrom(bak, realTarget); } catch {}
+  console.error(`写入失败：${String(e?.message ?? e)}（已回滚到 ${bak}）`);
+  process.exit(1);
+}
 // 写入后再验一次，不通过就回滚
 const post = (() => {
   const { execFileSync } = require("node:child_process");
-  const args = [join(dirname(new URL(import.meta.url).pathname), "resolve-check.mjs"), "--patch", o.patch, "--lint"];
+  const args = [join(dirname(new URL(import.meta.url).pathname), "resolve-check.mjs"), "--patch", realTarget, "--lint"];
   if (o.pluginRoot) args.push("--plugin-root", o.pluginRoot);
   try { return { ok: true, out: execFileSync(process.execPath, args, { encoding: "utf8" }) }; }
   catch (e) { return { ok: false, out: `${e.stdout ?? ""}${e.stderr ?? ""}` }; }
 })();
 if (!post.ok) {
-  copyFileSync(bak, o.patch);
+  try { rollbackFrom(bak, realTarget); } catch {}
   console.error("写入后校验失败，已回滚到备份 " + bak);
   console.error(post.out.trim().split("\n").slice(0, 10).map((l) => "  " + l).join("\n"));
   process.exit(1);
 }
-console.log(`✓ 已写入 ${o.patch}`);
+console.log(`✓ 已写入 ${realTarget}`);
 console.log(`  备份：${bak}`);
 console.log(`  路由：${o.route} / ${modelId}  ctx=${ctx} max=${maxTokens} input=[${input}]`);
+console.log(`  压缩：B=${budget.messageBudgetTokens} threshold=${budget.thresholdTokens} retain=${budget.retainTokens} gap=${budget.gap} ${budget.ok ? "✓" : "⚠"}`);
 console.log("  dsh-hmr 会热重载；如果重载校验失败，用备份恢复即可。");

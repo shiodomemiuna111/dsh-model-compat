@@ -33,9 +33,9 @@ DSH 的模型目录（`@earendil-works/pi-ai` 的 `dist/providers/data/*.json`�
 |---|---|---|
 | `GET /models` 能否列出该模型 | 能不能用「目录路由」而不是手写路由 | 200 且 id 命中。**注意 /models 通常不含窗口与模态** |
 | 基础 chat | key / baseURL / 协议是否通 | 200 且有 content |
-| `max_tokens=400000` | `maxTokens` 能写多大 | 200 = 接受；400 = 显式上限低于 400k |
+| `max_tokens` 阶梯下探（65536→4096） | `maxTokens` 能写多大 / 网关输出上限 `gateMaxTokens` | 取第一个 200 的档位；全 400 = 测不出（按保守值处理） |
 | 三种"关思考"写法 | `thinkingFormat` 选哪个 | 只有**真的能把 `reasoning_tokens` 归零**的写法才算 |
-| 1×1 PNG | `input` 要不要加 `image` | 200 且 prompt_tokens 上涨 / 有回答 |
+| 32×32 纯红 PNG + 问颜色 | `input` 要不要加 `image` | 必须答出 red（`/\bred\b|红/i`）；答别的颜色或空 = 疑似静默丢图 |
 | 流式 SSE | UI 能否显示思考过程 | `delta` 里有没有 `reasoning_content` |
 | `--window` 阶梯探测 | `contextWindow` | 用**真实单词文本**按固定阶梯递进，遇到 `context_length_exceeded` 停（不是二分；见 pitfalls） |
 

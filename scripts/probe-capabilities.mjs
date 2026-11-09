@@ -21,9 +21,9 @@
  * 探测内容（每项都标注了成本）：
  *   1. /models                    免费
  *   2. 基础 chat                    ~20 token
- *   3. 输出上限 max_tokens=400000    ~20 token（返回体小，不会被截断就不会多花）
- *   4. 思考开关（off 三种写法 / on 三种写法） 每次 ~30 token
- *   5. 视觉 1×1 PNG                ~20 token
+ *   3. 输出上限：max_tokens 阶梯下探 65536→4096  每档 ~20 token（取网关真正接受的最大值）
+ *   4. 思考：双向探测（默认开→试关；默认关→试开） 每次 ~30 token
+ *   5. 视觉 32×32 纯红 PNG + 问颜色 + 判 /red/i   ~20 token
  *   6. 流式 SSE 是否带 reasoning 增量  ~30 token
  *   7. 窗口：固定阶梯抽样（1M/2M/4M/8M 字符），取最大成功那次的 prompt_tokens
  *      ×0.95 向下取整到 4096 的倍数 —— 是「安全下界」，不是精确阈值。⚠ 默认关闭
@@ -37,8 +37,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const require = createRequire(import.meta.url);
-const PNG_1PX =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+// 32×32 纯红 PNG（v0.3.0：1×1 可能被「最小尺寸」限制拒，32×32 更稳）
+const PNG_RED_32 =
+  "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg==";
 
 function parseArgs(argv) {
   const o = { yaml: false, json: false, window: false, out: null };
@@ -153,10 +154,15 @@ async function main() {
       ...extra,
     });
 
-  // reasoning_tokens 缺失 = 没开思考（很多网关省略这个字段而不是给 0）
+  // 思考证据（v0.3.0：只认 usage.completion_tokens_details.reasoning_tokens 太脆弱，
+  // 很多网关只填 choices[0].message.reasoning_content，或者只给布尔）
   const reasoningOf = (j) => {
-    const v = j?.usage?.completion_tokens_details?.reasoning_tokens;
-    return typeof v === "number" ? v : 0;
+    const details = j?.usage?.completion_tokens_details;
+    if (typeof details?.reasoning_tokens === "number" && details.reasoning_tokens > 0) return details.reasoning_tokens;
+    if (details?.reasoning === true) return 1;
+    const rc = j?.choices?.[0]?.message?.reasoning_content;
+    if (typeof rc === "string" && rc.trim().length > 0) return rc.length;
+    return 0;
   };
   const nonEmpty = (j) => String(j?.choices?.[0]?.message?.content ?? "").trim().length > 0;
 
@@ -166,42 +172,111 @@ async function main() {
   save("chat", r);
   step("basic-chat", "~20 token", r.status, r.json?.error ? JSON.stringify(r.json.error).slice(0, 200) : `content=${JSON.stringify(r.json?.choices?.[0]?.message?.content ?? "").slice(0, 40)}`);
 
-  // 3 输出上限
-  let maxTokens = null;
-  r = await chat({ max_tokens: 400000 });
-  save("max-tokens-400k", r);
-  if (r.status === 200) maxTokens = 393216;
-  step("output-cap", "~20 token", r.status, r.status === 200 ? `accepts max_tokens=400000 ⇒ 声明 maxTokens 可到 393216` : `拒绝 400000：${JSON.stringify(r.json?.error ?? r.text.slice(0, 120)).slice(0, 200)}`);
+  // 3 输出上限：阶梯下探（v0.3.0，外部评审意见 3）
+  //    旧版只发一次 max_tokens=400000：多数模型/网关直接 400，测出来是「不支持 400k」，
+  //    却被当成「没有输出上限」。现在从 65536 往下一档档试，取网关真正接受的最大值。
+  const MAX_TOKENS_LADDER = [65536, 49152, 32768, 24576, 16384, 12288, 8192, 4096];
+  let gateMaxTokens = null;
+  let capDetail = [];
+  for (const n of MAX_TOKENS_LADDER) {
+    const rr = await chat({ max_tokens: n });
+    save(`max-tokens-${n}`, rr);
+    if (rr.status === 200) { gateMaxTokens = n; capDetail.push(`${n}✓`); break; }
+    capDetail.push(`${n}✗`);
+  }
+  if (gateMaxTokens === null) {
+    // 全拒：通常是网关限制，不代表模型本身没有上限；保守按 4096 处理并明确标注
+    capDetail.push("全部被拒→保守按 4096");
+  }
+  step("output-cap", "~20 token × 档数", gateMaxTokens ? 200 : 0,
+    gateMaxTokens ? `网关接受 max_tokens=${gateMaxTokens}（尝试：${capDetail.join(" ")}）` : `阶梯全部被拒（尝试：${capDetail.join(" ")}），无法测出真实上限`);
 
-  // 4 思考开关
-  const offVariants = { "enable_thinking:false": { enable_thinking: false }, 'thinking:{type:"disabled"}': { thinking: { type: "disabled" } }, "reasoning_effort:none": { reasoning_effort: "none" } };
-  const onVariants = { baseline: {}, "enable_thinking:true": { enable_thinking: true }, 'thinking:{type:"enabled"}': { thinking: { type: "enabled" } }, "reasoning_effort:low": { reasoning_effort: "low" } };
+  // 4 思考：双向探测（v0.3.0，外部评审意见 2）
+  //    旧版只测「怎么关」，遇到「默认关闭、要显式开」的模型会误判成不可调；
+  //    遇到「纯推理、关不掉」的模型会白写一个 off 档。
+  const question = [{ role: "user", content: "9.11 和 9.9 哪个大？只回答一个词" }];
+  const offVariants = {
+    "enable_thinking:false": { enable_thinking: false },
+    'thinking:{type:"disabled"}': { thinking: { type: "disabled" } },
+    "reasoning_effort:none": { reasoning_effort: "none" },
+  };
+  const onVariants = {
+    "enable_thinking:true": { enable_thinking: true },
+    'thinking:{type:"enabled"}': { thinking: { type: "enabled" } },
+    "reasoning_effort:low": { reasoning_effort: "low" },
+  };
+  const baseline = await chat({}, question);
+  save("thinking-baseline", baseline);
+  const baselineReasoning = reasoningOf(baseline.json);
+  const defaultOn = baselineReasoning > 0;
+
   const offResults = {}, onResults = {};
   for (const [name, extra] of Object.entries(offVariants)) {
-    const rr = await chat(extra, [{ role: "user", content: "9.11 和 9.9 哪个大？只回答一个词" }]);
+    const rr = await chat(extra, question);
     offResults[name] = { status: rr.status, reasoning: reasoningOf(rr.json), err: rr.json?.error ? JSON.stringify(rr.json.error).slice(0, 120) : null };
   }
   for (const [name, extra] of Object.entries(onVariants)) {
-    const rr = await chat(extra, [{ role: "user", content: "9.11 和 9.9 哪个大？只回答一个词" }]);
+    const rr = await chat(extra, question);
     onResults[name] = { status: rr.status, reasoning: reasoningOf(rr.json), err: rr.json?.error ? JSON.stringify(rr.json.error).slice(0, 120) : null };
   }
-  const switchable = Object.entries(offResults).filter(([, v]) => v.status === 200 && v.reasoning === 0).map(([k]) => k);
-  step("thinking-off", "~90 token", switchable.length ? 200 : 0, switchable.length ? `可关：${switchable.join("、")}` : `没有任何写法能把 reasoning 归零：${JSON.stringify(offResults)}`);
-  step("thinking-on", "~120 token", 200, JSON.stringify(onResults));
+  // 关得掉：默认开时，某个 off 写法把 reasoning 压到 0
+  const offWorks = defaultOn
+    ? Object.entries(offResults).filter(([, v]) => v.status === 200 && v.reasoning === 0).map(([k]) => k)
+    : [];
+  // 开得起来：默认关时，某个 on 写法让 reasoning > 0
+  const onWorks = !defaultOn
+    ? Object.entries(onResults).filter(([, v]) => v.status === 200 && v.reasoning > 0).map(([k]) => k)
+    : [];
+  const canDisable = defaultOn ? offWorks.length > 0 : true;
+  const canEnable = defaultOn ? true : onWorks.length > 0;
+  const switchable = defaultOn ? offWorks : onWorks;
+  step("thinking-baseline", "~30 token", baseline.status, `默认 ${defaultOn ? "开" : "关"}（reasoning=${baselineReasoning}）`);
+  step("thinking-off", "~90 token", offWorks.length || !defaultOn ? 200 : 0,
+    defaultOn ? (offWorks.length ? `可关：${offWorks.join("、")}` : `关不掉（纯推理模型？）：${JSON.stringify(offResults)}`) : "默认就是关的，不必测关");
+  step("thinking-on", "~90 token", onWorks.length || defaultOn ? 200 : 0,
+    defaultOn ? "默认开，无需测开" : (onWorks.length ? `可开：${onWorks.join("、")}` : `开不起来：${JSON.stringify(onResults)}`));
 
-  // 5 视觉
-  r = await chat({}, [{ role: "user", content: [{ type: "text", text: "这张图主要是什么颜色？一个词。" }, { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_1PX}` } }] }]);
+  // 思考格式：按「哪个写法真的改变了 reasoning」推定
+  const switchFormat = switchable.length === 0 ? null
+    : switchable.some((v) => String(v).startsWith("enable_thinking")) ? "qwen"
+    : switchable.some((v) => String(v).startsWith("thinking")) ? "deepseek"
+    : switchable.some((v) => String(v).startsWith("reasoning_effort")) ? "openai"
+    : null;
+  // 档位：只在「开关两个方向都测出差异」时给多档；否则给单档
+  const levels = canDisable && canEnable ? ["low", "high"] : [];
+  const thinking = {
+    format: switchFormat,
+    defaultOn,
+    canDisable,
+    canEnable,
+    levels,
+    question,
+  };
+
+  // 5 视觉：32×32 纯红 + 让模型说颜色（v0.3.0，外部评审意见 4）
+  //    旧判据「有回答 或 prompt_tokens 上涨」里「有回答」恒真 —— 静默丢图的网关会全放行。
+  //    现在必须真的把红色认出来；只回「不知道/看不到/白色」都算不可用。
+  r = await chat({}, [{
+    role: "user",
+    content: [
+      { type: "text", text: "Reply with one word only: is this image red, blue, or green?" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_RED_32}` } },
+    ],
+  }]);
   save("vision", r);
   const visionText = String(r.json?.choices?.[0]?.message?.content ?? "").trim();
   const visionTokens = r.json?.usage?.prompt_tokens ?? 0;
-  const visionOk = r.status === 200 && (visionText.length > 0 || visionTokens > 20);
+  const visionSaysRed = /\bred\b|红/i.test(visionText);
+  const visionOk = r.status === 200 && visionSaysRed;
   step(
     "vision",
     "~20 token",
     r.status,
-    visionOk
-      ? `答复=${JSON.stringify(visionText).slice(0, 40)}${visionText ? "" : "（无正文，但 prompt_tokens 上涨，图应已解析）"}`
-      : `不可用或未解析：${JSON.stringify(r.json?.error ?? r.text.slice(0, 160)).slice(0, 200)}`,
+    r.status !== 200
+      ? `不可用：${JSON.stringify(r.json?.error ?? r.text.slice(0, 160)).slice(0, 200)}`
+      : visionOk
+        ? `识别正确：答复=${JSON.stringify(visionText).slice(0, 40)}（prompt_tokens=${visionTokens}）`
+        : `疑似静默丢图：HTTP 200 但没识别出红色（答复=${JSON.stringify(visionText).slice(0, 60)}，prompt_tokens=${visionTokens}）`,
   );
 
   // 6 流式
@@ -242,28 +317,25 @@ async function main() {
     step("window", "跳过", 0, "默认不探测（花钱）；加 --window 才跑");
   }
 
-  // 汇总成可粘贴的 YAML
-  const supportsReasoning = switchable.length > 0;
-  // 思考格式只按「哪个写法真能把 reasoning_tokens 归零」推断；推不出就不写 compat。
-  const switchFormat = switchable.length === 0 ? null
-    : switchable.some((v) => String(v).startsWith("enable_thinking")) ? "qwen"
-    : switchable.some((v) => String(v).startsWith("thinking")) ? "deepseek"
-    : "openai";
-  const yamlSnippet = buildSnippet({
+  // 汇总成可粘贴的 YAML（v0.3.0：maxTokens 由 pickSafeMaxTokens 反推，不再硬编码）
+  const snippet = buildSnippet({
     base: o.base,
     model: o.model,
     contextWindow,
-    maxTokens,
+    gateMaxTokens,
     visionOk,
-    switchFormat,
-    reasoningSwitchable: supportsReasoning,
+    thinking,
   });
-  findings.yaml = yamlSnippet;
+  findings.yaml = snippet.yaml;
+  findings.snippet = { chosenMaxTokens: snippet.chosenMaxTokens, budget: snippet.budget, notes: snippet.notes };
   findings.summary = {
     listedInModels: listed,
     modelFields,
     accent: accentOf(o.base),
-    outputCap: maxTokens,
+    gateMaxTokens,
+    thinkingDefaultOn: defaultOn,
+    thinkingCanDisable: canDisable,
+    thinkingCanEnable: canEnable,
     thinkingSwitchable: switchable,
     vision: visionOk,
     streamDeltaKeys: [...deltaKeys],
@@ -275,9 +347,14 @@ async function main() {
   else {
     console.log(`端点 ${o.base}  模型 ${o.model}\n`);
     for (const s of findings.steps) console.log(`${s.status === 200 ? "✓" : s.status === 0 ? "·" : "✗"} ${s.name.padEnd(14)} ${s.detail}`);
-    if (o.yaml) console.log(`\n--- 可粘贴片段 ---\n${yamlSnippet}`);
+    if (o.yaml) {
+      console.log(`\n--- 可粘贴片段 ---\n${snippet.yaml}`);
+      if (snippet.notes.length) console.log(`\n注意：\n${snippet.notes.map((n) => "  · " + n).join("\n")}`);
+    }
   }
-  return findings.summary.outputCap || o.noOutputCheck ? 0 : 1;
+  // 关键步骤失败才算失败：/models 不可用不算（很多网关不实现），但基础 chat 或输出上限全拒要算
+  const basicOk = findings.steps.some((x) => x.name === "basic-chat" && x.status === 200);
+  return basicOk ? 0 : 1;
 }
 
 main()

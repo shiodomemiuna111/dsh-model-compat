@@ -22,6 +22,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { staticAudit } from "../lib/audit.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
+import { computeBudget, compactionConfigFromPatch, policyForRoute } from "../lib/compaction.mjs";
 import { createRequire } from "node:module";
 import { resolve as resolvePath, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -136,9 +137,12 @@ async function main() {
   const patches = args.patches.length ? args.patches : [DEFAULT_PATCH];
   let providers = {};
   const loaded = [];
+  let compactionConfig = null;   // dsh-compaction-basic 的 headroom / modelPolicies（可能不在补丁里）
   for (const file of patches) {
     const doc = await readYamlFile(resolvePath(file), plugin.root);
     loaded.push(file);
+    const c = compactionConfigFromPatch(doc);
+    if (c.found) compactionConfig = c;
     const list = Array.isArray(doc) ? doc : [];
     for (const entry of list) {
       if (entry?.id === "llm-pi-ai" && entry.config?.providers) {
@@ -159,11 +163,12 @@ async function main() {
     for (const [route, profile] of Object.entries(providers)) {
       let ok = true, msg = null, models = [];
       try {
-        const one = await verifyLoadPath(plugin.root, { [route]: profile }, "strict");
+        const one = await verifyLoadPath(plugin.root, { [route]: profile }, "strict", { compaction: compactionConfig });
         const r = one.routes[route];
         if (!one.schema.ok) { ok = false; msg = `Config 层：${one.schema.error}`; }
         else if (!one.semantic.ok) { ok = false; msg = `语义层：${one.semantic.error}`; }
         else if (!r || r.error) { ok = false; msg = r?.error ?? "解析失败"; }
+        else if (!one.budget.ok) { ok = false; msg = `压缩预算：${one.budget.failures.join("；")}`; }
         else models = r.models;
       } catch (e) {
         ok = false;
@@ -173,7 +178,7 @@ async function main() {
     }
     const bad = lintReport.filter((r) => !r.ok);
     if (!args.json) {
-      console.log("逐路由隔离检查（Config + 语义，一条不过不会拖累别的）：");
+      console.log("逐路由隔离检查（Config + 语义 + 压缩预算，一条不过不会拖累别的）：");
       for (const r of lintReport) {
         console.log(`  ${r.ok ? "✓" : "✗"} ${r.route}${r.ok ? ` [${r.models.join(", ")}]` : ` ← ${r.error}`}`);
       }
@@ -192,7 +197,7 @@ async function main() {
   }
 
   // 3) 严格解析（全体）：先 Config，再语义
-  const whole = await verifyLoadPath(plugin.root, providers, "strict");
+  const whole = await verifyLoadPath(plugin.root, providers, "strict", { compaction: compactionConfig });
   if (!whole.schema.ok) {
     console.error(`Config 层拒绝（整份）：${whole.schema.error}`);
     console.error(`提示：这正是 V5 及以前漏掉的一段；加 --lint 可逐条定位。`);
@@ -208,12 +213,18 @@ async function main() {
     }
     failed = true;
   }
+  if (!whole.budget.ok) {
+    console.error(`压缩预算拒绝（整份）：`);
+    for (const f of whole.budget.failures) console.error(`  ✗ ${f}`);
+    console.error(`提示：这是 dsh-compaction-basic 的检查（第三个包），Config/resolveProfiles 不会拦。`);
+    failed = true;
+  }
   if (failed && !args.json && !args.lint) return 1;
 
   // 逐路由结果（deferred 语义下拿到的完整清单）
   const routes = new Map();
   {
-    const probe = await verifyLoadPath(plugin.root, providers, "deferred");
+    const probe = await verifyLoadPath(plugin.root, providers, "deferred", { compaction: compactionConfig });
     for (const [route, r] of Object.entries(probe.routes)) {
       routes.set(route, r);
     }
@@ -229,25 +240,30 @@ async function main() {
     for (const d of resolved.details ?? []) report.push({ route, ...d });
   }
 
-  // 可选：检查压缩联动数字（阈值/保留/缓冲带）
+  // 可选：检查压缩联动数字（阈值/保留/缓冲带）——公式来自 lib/compaction.mjs
   const budget = [];
   if (args.budget) {
-    const seen = new Map();
+    const seen = new Set();
     for (const r of report) {
       if (r.error || !r.contextWindow || !r.maxTokens) continue;
-      if (seen.has(r.route)) continue;
-      seen.set(r.route, true);
-      const B = r.contextWindow - r.maxTokens;
-      const pressure = B - args.headroom;
-      const threshold = Math.floor(Math.min(0.8 * r.contextWindow, pressure));
-      const retain = Math.floor(B * 0.16);
-      const gap = threshold - retain;
-      const problems = [];
-      if (pressure <= 0) problems.push("pressure≤0（会报 TargetPressureConfigError）");
-      if (retain >= threshold) problems.push("retain≥threshold（配置被拒）");
-      if (gap < 30000) problems.push(`缓冲带 ${gap}<30000（会抖动）`);
-      if (problems.length) failed = true;
-      budget.push({ route: r.route, B, pressure, threshold, retain, gap, problems });
+      const key = `${r.route}/${r.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const policy = policyForRoute(
+        compactionConfig ?? { headroomTokens: args.headroom, thresholdRatio: 0.8, retainRatio: 0.16, retainTokens: null, modelPolicies: [] },
+        r.route,
+        r.id,
+      );
+      const b = computeBudget({
+        contextWindow: r.contextWindow,
+        reservedCompletionTokens: r.maxTokens,
+        headroomTokens: args.headroom === 65536 ? policy.headroomTokens : args.headroom,
+        thresholdRatio: policy.thresholdRatio,
+        retainRatio: policy.retainRatio,
+        retainTokens: policy.retainTokens,
+      });
+      if (!b.ok) failed = true;
+      budget.push({ route: r.route, id: r.id, B: b.messageBudgetTokens, pressure: b.pressureBudgetTokens, threshold: b.thresholdTokens, retain: b.retainTokens, gap: b.gap, problems: b.problems });
     }
   }
 

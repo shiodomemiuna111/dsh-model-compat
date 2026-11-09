@@ -609,7 +609,7 @@ test("inject-model 写进 4 空格缩进的文件：手写路由保留、缩进�
 
 test("片段：没有思考证据时不写 compat 块（旧版会写 thinkingFormat: null → 解析被拒）", async () => {
   const { buildSnippet } = await import("../lib/snippet.mjs");
-  const text = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: 400000, maxTokens: 65536, visionOk: false, switchFormat: null, reasoningSwitchable: false });
+  const { yaml: text } = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: 400000, gateMaxTokens: 65536, visionOk: false, thinking: null });
   assert.doesNotMatch(text, /compat:/);
   assert.doesNotMatch(text, /thinkingFormat:/);
   assert.match(text, /reasoningEfforts: false/);
@@ -617,12 +617,39 @@ test("片段：没有思考证据时不写 compat 块（旧版会写 thinkingFor
 
 test("片段：没测窗口时用保守占位而不是 1000000，并带警告注释", async () => {
   const { buildSnippet, UNMEASURED_CONTEXT_WINDOW } = await import("../lib/snippet.mjs");
-  const text = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: null, maxTokens: null, visionOk: false, switchFormat: null, reasoningSwitchable: false });
+  const { yaml: text, notes } = buildSnippet({ base: "https://x.invalid/v1", model: "m", contextWindow: null, gateMaxTokens: null, visionOk: false, thinking: null });
   assert.match(text, /contextWindow: 200000/);
   assert.equal(UNMEASURED_CONTEXT_WINDOW, 200000);
   assert.doesNotMatch(text, /contextWindow: 1000000/);
   assert.match(text, /没测/);
-  assert.match(text, /maxTokens: 65536/);
+  assert.ok(notes.some((n) => n.includes("contextWindow 没测")));
+});
+
+test("片段：maxTokens 由预算反推，不再硬编码 65536（ctx=131072 时 65536 会 pressure=0）", async () => {
+  const { buildSnippet } = await import("../lib/snippet.mjs");
+  const { yaml: text, chosenMaxTokens, budget } = buildSnippet({
+    base: "https://x.invalid/v1", model: "m", contextWindow: 131072, gateMaxTokens: 65536, visionOk: false, thinking: null,
+  });
+  assert.ok(chosenMaxTokens < 65536, `应下调，实际 ${chosenMaxTokens}`);
+  assert.match(text, new RegExp(`maxTokens: ${chosenMaxTokens}`));
+  assert.equal(budget.ok, true, JSON.stringify(budget.problems));
+  assert.doesNotMatch(text, /maxTokens: 65536/);
+});
+
+test("片段：纯推理模型不写 off 档；可关才写 off", async () => {
+  const { buildSnippet } = await import("../lib/snippet.mjs");
+  const pure = buildSnippet({
+    base: "https://x.invalid/v1", model: "m", contextWindow: 200000, gateMaxTokens: 32768, visionOk: false,
+    thinking: { format: "deepseek", defaultOn: true, canDisable: false, canEnable: true, levels: [] },
+  }).yaml;
+  assert.doesNotMatch(pure, /off: null/, pure);
+  assert.match(pure, /reasoningEfforts:\n\s+high: "high"/, pure);
+  const closable = buildSnippet({
+    base: "https://x.invalid/v1", model: "m", contextWindow: 200000, gateMaxTokens: 32768, visionOk: false,
+    thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, levels: ["low", "high"] },
+  }).yaml;
+  assert.match(closable, /off: null/);
+  assert.match(closable, /low: "low"/);
 });
 
 test("片段：有无证据两种形态都能通过两段加载 + 压缩联动", skipIfNoPlugin, async () => {
@@ -630,12 +657,12 @@ test("片段：有无证据两种形态都能通过两段加载 + 压缩联动",
   const d = tmp();
   const head = `- id: llm-pi-ai\n  name: "@deepseek-ai/dsh-llm-pi-ai"\n  config:\n    providers:\n`;
   const cases = {
-    "no-evidence": { contextWindow: null, maxTokens: null, visionOk: false, switchFormat: null, reasoningSwitchable: false },
-    "measured": { contextWindow: 400000, maxTokens: 65536, visionOk: true, switchFormat: "qwen", reasoningSwitchable: true },
+    "no-evidence": { contextWindow: null, gateMaxTokens: null, visionOk: false, thinking: null },
+    "measured": { contextWindow: 400000, gateMaxTokens: 65536, visionOk: true, thinking: { format: "qwen", defaultOn: true, canDisable: true, canEnable: true, levels: ["low", "high"] } },
   };
   for (const [name, c] of Object.entries(cases)) {
     const f = join(d, `${name}.yml`);
-    writeFileSync(f, head + buildSnippet({ base: "https://x.invalid/v1", model: "m", ...c }));
+    writeFileSync(f, head + buildSnippet({ base: "https://x.invalid/v1", model: "m", ...c }).yaml);
     const r = execFileSync(process.execPath, [join(ROOT, "scripts", "resolve-check.mjs"), "--patch", f, "--lint", "--budget"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     assert.match(r, /✓ custom-x-invalid \/ m/, `${name}: ${r.slice(0, 400)}`);
@@ -667,4 +694,192 @@ test("反证：旧模板的 thinkingFormat: null 会被真实解析拒绝（这�
   assert.equal(code, 1, out);
   assert.match(out, /with no value/);
   rmSync(d, { recursive: true, force: true });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 10：v0.3.0 —— 第 3 段压缩预算、原子写、compaction 配置、审计新规则
+//   这些全是外部评审指出的「两层放行但启动就炸 / 写盘读到半截」的真问题。
+// ═══════════════════════════════════════════════════════════════════════
+
+test("Stage 3：ctx=131072 + maxTokens=128000 被抓（pressure=-62464），128000 不会走到写盘", skipIfNoPlugin, async () => {
+  const bad = await verifyLoadPath(PLUGIN, {
+    r: { api: "openai-completions", baseURL: "https://x.invalid/v1", models: [{ id: "m", contextWindow: 131072, maxTokens: 128000 }] },
+  }, "strict");
+  assert.equal(bad.schema.ok, true, "Config 层本来是放行的（这正是漏洞）");
+  assert.equal(bad.budget.ok, false, "第 3 段必须抓到");
+  assert.match(bad.budget.failures.join("\n"), /pressureBudget = -62464/);
+});
+
+test("Stage 3：同样的窗口配 maxTokens=16384 就通过（gap≥30000）", skipIfNoPlugin, async () => {
+  const good = await verifyLoadPath(PLUGIN, {
+    r: { api: "openai-completions", baseURL: "https://x.invalid/v1", models: [{ id: "m", contextWindow: 131072, maxTokens: 16384 }] },
+  }, "strict");
+  assert.equal(good.budget.ok, true, JSON.stringify(good.budget));
+  assert.equal(good.budget.failures.length, 0);
+});
+
+test("Stage 3：retainTokens≥thresholdTokens 被抓（极小窗口）", async () => {
+  const { computeBudget } = await import("../lib/compaction.mjs");
+  const b = computeBudget({ contextWindow: 4096, reservedCompletionTokens: 1024, headroomTokens: 65536 });
+  assert.equal(b.ok, false);
+  assert.match(b.problems.join("\n"), /pressureBudget = -62464 ≤ 0/);
+});
+
+test("fs-safe：原子写不留临时文件、软链不被替换", async () => {
+  const { atomicWriteFile, resolveWriteTarget, backupFile } = await import("../lib/fs-safe.mjs");
+  const d = tmp();
+  const real = join(d, "real.yml");
+  const link = join(d, "link.yml");
+  writeFileSync(real, "a: 1\n");
+  const { symlinkSync } = await import("node:fs");
+  symlinkSync(real, link);
+  const { target, viaSymlink } = resolveWriteTarget(link);
+  assert.equal(viaSymlink, true);
+  assert.equal(target, real);
+  atomicWriteFile(target, "b: 2\n");
+  assert.equal(readFileSync(real, "utf8"), "b: 2\n");
+  const { lstatSync } = await import("node:fs");
+  assert.ok(lstatSync(link).isSymbolicLink(), "软链必须还在");
+  assert.deepEqual(readdirSync(d).filter((f) => f.includes(".tmp-")), [], "不能留临时文件");
+  const bak = backupFile(link, "T1");
+  assert.equal(readFileSync(bak, "utf8"), "b: 2\n");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("fs-safe：check 抛错时不替换目标（半截文件不会落到被监听路径）", async () => {
+  const { atomicWriteFile } = await import("../lib/fs-safe.mjs");
+  const d = tmp();
+  const f = join(d, "p.yml");
+  writeFileSync(f, "old: 1\n");
+  assert.throws(() => atomicWriteFile(f, "bad: [\n", { check: () => { throw new Error("nope"); } }));
+  assert.equal(readFileSync(f, "utf8"), "old: 1\n");
+  assert.deepEqual(readdirSync(d).filter((x) => x.includes(".tmp-")), []);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("context-budget --patch 读 compaction-basic 的 headroomTokens", async () => {
+  const d = tmp();
+  const f = join(d, "patch.yml");
+  writeFileSync(f, `- id: dsh-compaction-basic
+  config:
+    headroomTokens: 16384
+`);
+  const out = JSON.parse(execFileSync(process.execPath, [join(ROOT, "scripts", "context-budget.mjs"),
+    "--ctx", "131072", "--max", "16384", "--patch", f, "--json"], { encoding: "utf8" }));
+  assert.equal(out.headroomTokens, 16384, JSON.stringify(out));
+  assert.equal(out.source, "patch", JSON.stringify(out));
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("审计：thinkingFormat 挂在 reasoningEfforts:false 上要 warn", () => {
+  const a = staticAudit({ r: { models: [{ id: "m", reasoningEfforts: false, compat: { thinkingFormat: "qwen" } }] } });
+  assert.ok(a.some((x) => x.code === "thinking-format-without-efforts"), JSON.stringify(a));
+});
+
+test("审计：thinkingTokenBudgetField 但路由没有 thinkingBudgets 要 warn", () => {
+  const a = staticAudit({ r: { models: [{ id: "m", compat: { supportsThinkingTokenBudget: true, thinkingTokenBudgetField: "thinking_budget" } }] } });
+  assert.ok(a.some((x) => x.code === "thinking-budget-without-map"), JSON.stringify(a));
+  const b = staticAudit({ r: { thinkingBudgets: { low: 1024 }, models: [{ id: "m", compat: { supportsThinkingTokenBudget: true } }] } });
+  assert.ok(!b.some((x) => x.code === "thinking-budget-without-map"), JSON.stringify(b));
+});
+
+test("审计：qwen 多档位但没声明 supportsReasoningEffort 要 warn", () => {
+  const a = staticAudit({ r: { models: [{ id: "m", compat: { thinkingFormat: "qwen" }, reasoningEfforts: { off: null, low: "low", high: "high" } }] } });
+  assert.ok(a.some((x) => x.code === "qwen-levels-may-collapse"), JSON.stringify(a));
+  const b = staticAudit({ r: { models: [{ id: "m", compat: { thinkingFormat: "qwen", supportsReasoningEffort: true }, reasoningEfforts: { off: null, low: "low", high: "high" } }] } });
+  assert.ok(!b.some((x) => x.code === "qwen-levels-may-collapse"), JSON.stringify(b));
+});
+
+test("审计：thinkingBudgets 是合法路由字段（不会误报未知字段）", () => {
+  const a = staticAudit({ r: { thinkingBudgets: { low: 1024 }, models: [{ id: "m" }] } });
+  assert.ok(!a.some((x) => x.code === "unknown-route-key"), JSON.stringify(a));
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 11：mock 网关（外部评审要求「补 mock 网关测试」）
+//   真实网关没法在 CI 里跑，但探测逻辑的坑全都能用本地假端点复现：
+//     ① 静默丢图：HTTP 200、图被扔掉、模型答非红 → 必须判 vision=false
+//     ② 默认关思考：只有 enable_thinking:true 才出 reasoning → canEnable=true、format=qwen
+//     ③ max_tokens 阶梯：>16384 一律 400 → gateMaxTokens 必须收敛到 16384
+// ═══════════════════════════════════════════════════════════════════════
+
+async function runNode(args) {
+  const { execFile } = await import("node:child_process");
+  return await new Promise((resolve) => {
+    execFile(process.execPath, args, { encoding: "utf8" }, (err, stdout, stderr) => resolve({ code: err?.code ?? 0, stdout, stderr }));
+  });
+}
+
+async function startMockGateway({ rejectAbove = 16384, silentImage = true } = {}) {
+  const { createServer } = await import("node:http");
+  const srv = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const j = body ? JSON.parse(body) : {};
+      const send = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+      if (req.url.endsWith("/models")) return send(200, { data: [{ id: "mock-1" }] });
+      if (!req.url.endsWith("/chat/completions")) return send(404, { error: { message: "no route" } });
+      if (j.max_tokens > rejectAbove) return send(400, { error: { message: `max_tokens too large (${j.max_tokens})` } });
+      const hasImage = JSON.stringify(j.messages ?? []).includes("image_url");
+      const thinking = j.enable_thinking === true || j.thinking?.type === "enabled" || Boolean(j.reasoning_effort);
+      const content = hasImage ? (silentImage ? "blue" : "red") : "ok";
+      send(200, {
+        choices: [{ message: { content, ...(thinking ? { reasoning_content: "…" } : {}) } }],
+        usage: { prompt_tokens: hasImage ? 400 : 20, completion_tokens: 1, ...(thinking ? { completion_tokens_details: { reasoning_tokens: 7 } } : {}) },
+      });
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { srv, port: srv.address().port };
+}
+
+test("mock 网关：静默丢图（200 但答 blue）→ vision 必须判 false", async () => {
+  const { srv, port } = await startMockGateway({ silentImage: true });
+  try {
+    const r = await runNode([join(ROOT, "scripts", "probe-capabilities.mjs"),
+      "--base", `http://127.0.0.1:${port}/v1`, "--model", "mock-1", "--key", "k", "--json", "--yaml"]);
+    const out = r.stdout;
+    const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
+    assert.equal(j.summary.vision, false, JSON.stringify(j.summary));
+    assert.doesNotMatch(j.yaml, /input: \[text, image\]/);
+  } finally { srv.close(); }
+});
+
+test("mock 网关：真的认红色 → vision true 且片段写 image", async () => {
+  const { srv, port } = await startMockGateway({ silentImage: false });
+  try {
+    const r = await runNode([join(ROOT, "scripts", "probe-capabilities.mjs"),
+      "--base", `http://127.0.0.1:${port}/v1`, "--model", "mock-1", "--key", "k", "--json", "--yaml"]);
+    const out = r.stdout;
+    const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
+    assert.equal(j.summary.vision, true, JSON.stringify(j.summary));
+    assert.match(j.yaml, /input: \[text, image\]/);
+  } finally { srv.close(); }
+});
+
+test("mock 网关：max_tokens>16384 全 400 → gateMaxTokens 收敛到 16384", async () => {
+  const { srv, port } = await startMockGateway({ rejectAbove: 16384 });
+  try {
+    const r = await runNode([join(ROOT, "scripts", "probe-capabilities.mjs"),
+      "--base", `http://127.0.0.1:${port}/v1`, "--model", "mock-1", "--key", "k", "--json"]);
+    const out = r.stdout;
+    const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
+    assert.equal(j.summary.gateMaxTokens, 16384, JSON.stringify(j.summary));
+  } finally { srv.close(); }
+});
+
+test("mock 网关：默认关思考、只有 enable_thinking:true 能开 → canEnable/format=qwen", async () => {
+  const { srv, port } = await startMockGateway({});
+  try {
+    const r = await runNode([join(ROOT, "scripts", "probe-capabilities.mjs"),
+      "--base", `http://127.0.0.1:${port}/v1`, "--model", "mock-1", "--key", "k", "--json", "--yaml"]);
+    const out = r.stdout;
+    const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
+    assert.equal(j.summary.thinkingDefaultOn, false);
+    assert.equal(j.summary.thinkingCanEnable, true);
+    assert.match(j.yaml, /reasoningEfforts:/);
+  } finally { srv.close(); }
 });

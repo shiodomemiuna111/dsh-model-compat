@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-compat",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Probe and declare third-party OpenAI-compatible model capabilities for DeepSeek Harness (dsh).",

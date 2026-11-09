@@ -16,13 +16,15 @@
  *
  * 另外：探针文件除了 finally 清理，还注册了 process 退出钩子，SIGINT 时也会删。
  */
-import { readFileSync, writeFileSync, existsSync, copyFileSync, rmSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { staticAudit } from "../lib/audit.mjs";
 import { verifyLoadPath } from "../lib/load-path.mjs";
 import { locateProviders, removeRouteBlock, renderManagedBlock, findManagedBlock } from "../lib/yaml-edit.mjs";
+import { compactionConfigFromPatch } from "../lib/compaction.mjs";
+import { resolveWriteTarget, atomicWriteFile, backupFile, rollbackFrom } from "../lib/fs-safe.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -128,6 +130,9 @@ for (const f of o.from) {
 }
 if (Object.keys(candidates).length === 0) { console.error("没有找到任何候选路由"); process.exit(1); }
 
+// 目标文件里 dsh-compaction-basic 的配置（读到目标文件后才填；先声明避免 TDZ）
+let targetCompaction = null;
+
 // ── 2. 逐路由隔离验证（修复 A：整体解析抛错时降级成逐条结果）
 async function verifyIsolated() {
   const good = [], bad = [];
@@ -142,10 +147,10 @@ async function verifyIsolated() {
     const audit = staticAudit({ [route]: profile }).filter((a) => a.level === "error");
     if (audit.length > 0) { bad.push({ route, why: audit.map((a) => a.msg).join("；") }); continue; }
 
-    // 单条隔离：这条自己能不能过两段加载路径
+    // 单条隔离：这条自己能不能过「两段加载 + 第 3 段压缩预算」
     let single;
     try {
-      single = await verifyLoadPath(pluginRoot, { [route]: profile }, "strict");
+      single = await verifyLoadPath(pluginRoot, { [route]: profile }, "strict", { compaction: targetCompaction });
     } catch (e) {
       bad.push({ route, why: `校验时抛错：${String(e?.message ?? e).split("\n")[0]}` });
       continue;
@@ -155,6 +160,8 @@ async function verifyIsolated() {
     if (!single.semantic.ok) { bad.push({ route, why: `语义层拒绝：${single.semantic.error}` }); continue; }
     if (!r || r.error) { bad.push({ route, why: r?.error ?? "解析失败（无具体信息）" }); continue; }
     if (r.models.length === 0) { bad.push({ route, why: "解析成功但没有任何模型" }); continue; }
+    // 第 3 段：压缩预算（前两段全绿但启动会抛 TargetPressureConfigError 的情形）
+    if (!single.budget.ok) { bad.push({ route, why: `压缩预算不通过：${single.budget.failures.join("；")}` }); continue; }
     good.push({ route, profile });
   }
   return { good, bad, batch };
@@ -181,6 +188,7 @@ const targetProviders = {};
 {
   try {
     const d = YAML.parse(targetLines.join("\n"));
+    targetCompaction = compactionConfigFromPatch(d);
     Object.assign(targetProviders, (Array.isArray(d) ? d.find((e) => e?.id === "llm-pi-ai")?.config?.providers : d?.providers) ?? {});
   } catch (e) {
     console.error(`目标文件解析失败（未改动）：${String(e?.message ?? e).split("\n")[0]}`);
@@ -273,30 +281,39 @@ if (o.dryRun) {
 }
 if (next === target) { console.log("\n文件已是最新，未改动。"); process.exit(0); }
 
-// ── 7. 写前备份（修复 D：毫秒 + 自增）→ 写入 → 复验 → 失败回滚
-function backupPath(base) {
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "") + "-" + String(Date.now() % 1000).padStart(3, "0");
-  let p = `${base}.bak-${stamp}`;
-  for (let n = 1; existsSync(p); n++) p = `${base}.bak-${stamp}-${n}`;
-  return p;
+function stamp() {
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "") + "-" + String(Date.now() % 1000).padStart(3, "0");
 }
-const bak = backupPath(o.patch);
-try { copyFileSync(o.patch, bak); }
-catch (e) { console.error(`无法创建备份 ${bak}：${String(e?.message ?? e)}（目录只读？）未改动文件。`); process.exit(1); }
+
+// ── 7. 写前备份（软链先解析）→ 原子写入（临时文件 + rename）→ 复验 → 失败原子回滚
+const { target: realTarget, viaSymlink } = resolveWriteTarget(o.patch);
+if (viaSymlink) console.error(`注意：${o.patch} 是软链，实际写入 ${realTarget}（不会把软链替换成普通文件）。`);
+let bak;
+try { bak = backupFile(o.patch, stamp()); }
+catch (e) { console.error(`无法创建备份：${String(e?.message ?? e)}（目录只读？）未改动文件。`); process.exit(1); }
 
 function rollback(reason) {
-  try { copyFileSync(bak, o.patch); } catch (e) { console.error(`回滚失败！${String(e?.message ?? e)}`); }
+  try { rollbackFrom(bak, realTarget); } catch (e) { console.error(`回滚失败！${String(e?.message ?? e)}`); }
   console.error(`\n${reason}\n已回滚到 ${bak}`);
   process.exit(1);
 }
 
-try { writeFileSync(o.patch, next); }
-catch (e) { rollback(`写盘失败：${String(e?.message ?? e)}`); }
+try {
+  // 写入全程不产生「半截文件」：先写同目录临时文件、校验通过才 rename 覆盖目标。
+  // 这对被 dsh-hmr 实时监听的 cordis.patch.yml 是必须的（评审意见 6）。
+  atomicWriteFile(realTarget, next, {
+    check: (text) => {
+      const d = YAML.parse(text);
+      const provs = Array.isArray(d) ? d.find((e) => e?.id === "llm-pi-ai")?.config?.providers : d?.providers;
+      if (!provs || typeof provs !== "object") throw new Error("写入前复验：llm-pi-ai.config.providers 不见了");
+    },
+  });
+} catch (e) { rollback(`写盘失败：${String(e?.message ?? e)}`); }
 
 if (o.verify) {
   try {
     // 修复 F：只复验托管块里的路由，块外手写的问题不连累本次导入
-    const check = YAML.parse(readFileSync(o.patch, "utf8"));
+    const check = YAML.parse(readFileSync(realTarget, "utf8"));
     const provsOf = (d) => (Array.isArray(d) ? d.find((e) => e?.id === "llm-pi-ai")?.config?.providers : null);
     const nowProvs = provsOf(check);
     if (!nowProvs || typeof nowProvs !== "object") throw new Error("复验：llm-pi-ai.config.providers 不见了");
@@ -305,8 +322,9 @@ if (o.verify) {
       if (!(g.route in nowProvs)) throw new Error(`复验：刚写入的路由 ${g.route} 没出现在 providers 里`);
       mine[g.route] = nowProvs[g.route];
     }
-    const again = await verifyLoadPath(pluginRoot, mine, "strict");
+    const again = await verifyLoadPath(pluginRoot, mine, "strict", { compaction: targetCompaction });
     if (!again.schema.ok) throw new Error(`复验 Config 层：${again.schema.error}`);
+    if (!again.budget.ok) throw new Error(`复验压缩预算：${again.budget.failures.join("；")}`);
     const stillBad = [];
     for (const g of good) {
       const r = again.routes[g.route];
@@ -319,7 +337,7 @@ if (o.verify) {
     rollback(`复验失败：${String(e?.message ?? e)}`);
   }
 }
-console.log(`\n✓ 已写入 ${o.patch}（备份 ${bak}）`);
+console.log(`\n✓ 已写入 ${realTarget}（备份 ${bak}${viaSymlink ? `，原路径是软链 ${o.patch}` : ""}）`);
 console.log(`  托管块内 ${good.length} 条；块外的手写路由未改动。`);
 if (batch?.strictError && bad.length === 0) console.log(`  提示：整批一起解析仍报错（单条隔离已通过）：${batch.strictError.slice(0, 160)}`);
 process.exit(0);
