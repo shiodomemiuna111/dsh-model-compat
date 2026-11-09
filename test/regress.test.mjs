@@ -997,3 +997,58 @@ test("compaction：minContextWindowFor 计入 gap/retain（不只是 max+headroo
   assert.equal(computeBudget({ contextWindow: min - 1, reservedCompletionTokens: 4096, headroomTokens: 65536 }).ok, false);
   assert.notEqual(min, 4096 + 65536 + 1, "不能再只算 pressure");
 });
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 组 14：probe-capabilities 端到端（mock 网关 → 探测结论 → 片段）
+//   v0.3.1 的两个判断只有端到端才能验证：
+//     ① 布尔开关端点（只有 enable_thinking 管用）→ 单档，不写 supportsReasoningEffort
+//     ② effort 端点（reasoning_effort 管用）→ 双档 + supportsReasoningEffort: true
+// ═══════════════════════════════════════════════════════════════════════
+
+async function startThinkingGateway(mechanism) {
+  const { createServer } = await import("node:http");
+  const srv = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const j = body ? JSON.parse(body) : {};
+      const send = (code, obj) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+      if (req.url.endsWith("/models")) return send(200, { data: [{ id: "mock-1" }] });
+      if (!req.url.endsWith("/chat/completions")) return send(404, { error: { message: "no route" } });
+      if (j.max_tokens > 32768) return send(400, { error: { message: "too large" } });
+      const hasImage = JSON.stringify(j.messages ?? []).includes("image_url");
+      let reasoning = 0;
+      if (mechanism === "boolean") reasoning = j.enable_thinking === true ? 30 : 0;
+      else reasoning = j.reasoning_effort === "low" ? 10 : j.reasoning_effort === "high" ? 40 : 0;
+      const content = hasImage ? "red" : "1+1=2";
+      send(200, {
+        choices: [{ message: { content, ...(reasoning ? { reasoning_content: "x".repeat(reasoning) } : {}) } }],
+        usage: { prompt_tokens: 20, completion_tokens: 2, ...(reasoning ? { completion_tokens_details: { reasoning_tokens: reasoning } } : {}) },
+      });
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { base: `http://127.0.0.1:${srv.address().port}/v1`, close: () => srv.close() };
+}
+
+for (const [mechanism, wantFormat, wantEffort] of [["boolean", "qwen", false], ["effort", "openai", true]]) {
+  test(`probe+mock：${mechanism} 开关端点 → format=${wantFormat}、supportsEffort=${wantEffort}`, async () => {
+    const gw = await startThinkingGateway(mechanism);
+    try {
+      const r = await runNode([
+        new URL("../scripts/probe-capabilities.mjs", import.meta.url).pathname,
+        "--base", gw.base, "--model", "mock-1", "--key", "k", "--json",
+      ]);
+      assert.equal(r.code, 0, r.stderr);
+      const d = JSON.parse(r.stdout);
+      assert.equal(d.summary.switchFormat, wantFormat);
+      assert.equal(d.summary.thinkingSupportsEffort, wantEffort);
+      const levels = (d.yaml.match(/^\s+(low|high):/gm) ?? []).length;
+      assert.equal(levels, wantEffort ? 2 : 1, wantEffort ? "effort 端点应给两档" : "布尔端点只该给一档");
+      assert.equal(/supportsReasoningEffort: true/.test(d.yaml), wantEffort);
+      assert.equal(d.summary.vision, true, "红图判据应通过");
+      assert.equal(d.summary.gateMaxTokens, 32768, "阶梯应收敛到 32768");
+    } finally { gw.close(); }
+  });
+}

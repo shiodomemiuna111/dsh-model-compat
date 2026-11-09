@@ -12,7 +12,7 @@
 2. **验**——不启动 DSH，直接让 `dsh-llm-pi-ai` 的校验路径解析你写的 YAML，并顺带算压缩联动数字；
 3. **跨版本复验**——同一份 YAML 丢给 5 个历史版本，证明方案不是只对新版有效。
 
-> **v0.3.1**（自审）：`inject-model` 的 `reasoningEfforts` 不再写死；`snippet` 在小窗口下直接判 `fatal` 而不是给出必然被拒的 `maxTokens`；`minContextWindowFor` 计入 `gap>=30000`（4096 → 117829）；qwen 布尔开关只写一档并补 `supportsReasoningEffort`。测试 69 条。
+> **v0.3.1**（自审）：`inject-model` 的 `reasoningEfforts` 不再写死；`snippet` 在小窗口下直接判 `fatal` 而不是给出必然被拒的 `maxTokens`；`minContextWindowFor` 计入 `gap>=30000`（4096 → 117829）；qwen 布尔开关只写一档并补 `supportsReasoningEffort`。测试 71 条（组 14 补了 probe 端到端）。
 >
 > **v0.3.0**（对外部评审的回应）：探测判据全部重写（`max_tokens` 阶梯下探、思考双向探测、32×32 纯红 PNG 判颜色、多信号 reasoning 判据）；新增**第 3 段**压缩预算校验（`dsh-compaction-basic` 的 `TargetPressureConfigError` 写前就能抓到）；写盘改 `realpath + 临时文件 + rename` 原子替换；探针移出 `node_modules`；`context-budget --patch` 能读你的 compaction 配置；补 mock 网关测试。测试 47 → **66 条**（含 mock 网关与 wire payload 断言）。
 
