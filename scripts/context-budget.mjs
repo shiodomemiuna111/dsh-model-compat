@@ -95,8 +95,9 @@ const out = {
 if (opt.json) console.log(JSON.stringify(out, null, 2));
 else {
   console.log(`contextWindow=${opt.ctx}  maxTokens=${opt.max}  headroom=${out.headroom}  来源=${out.source === "patch" ? (opt.patch + (out.policy ? `（${out.policy}）` : "")) : "命令行/默认值"}`);
+  const show = (v) => (v === undefined || v === null ? "—（预算先失败，后面算不出来）" : v);
   console.log(`  messageBudget B = ${budget.messageBudgetTokens}`);
-  console.log(`  pressure        = ${budget.pressureBudgetTokens}`);
+  console.log(`  pressure        = ${show(budget.pressureBudgetTokens)}`);
   console.log(`  threshold       = ${budget.thresholdTokens}   ← 到这开始压缩`);
   console.log(`  retain          = ${budget.retainTokens}     ← 压缩后留多少尾巴`);
   console.log(`  gap             = ${budget.gap}     ${budget.gap >= (opt.minGap ?? 30000) ? "✓" : "✗ 太小，会抖动"}`);
